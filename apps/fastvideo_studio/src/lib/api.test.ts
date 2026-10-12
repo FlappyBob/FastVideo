@@ -11,3 +11,14 @@ it('shows the backend validation error returned when creating a job', async () =
   await expect(createJob({ model_id: 'model', prompt: 'cat', attention_backend: 'typo' }))
     .rejects.toThrow('Unknown attention backend typo');
 });
+
+it('identifies the actual API address when listing jobs cannot connect', async () => {
+  const { getJobsList } = await import('./api');
+  localStorage.setItem('fastvideo-default-options', JSON.stringify({ apiServerBaseUrl: 'http://127.0.0.1:8191/api/' }));
+  const fetch = vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
+  vi.stubGlobal('fetch', fetch);
+  try {
+    await expect(getJobsList('inference')).rejects.toThrow('http://127.0.0.1:8191/api/jobs?job_type=inference');
+    expect(fetch).toHaveBeenCalledTimes(1);
+  } finally { localStorage.clear(); }
+});

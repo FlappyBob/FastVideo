@@ -7,6 +7,7 @@ import JobCard from '@/components/jobs/JobCard';
 import { Button } from '@/components/ui/button';
 import { useStore } from '@/hooks/useStore';
 import { getJobsList } from '@/lib/api';
+import { ApiConnectionError } from '@/lib/apiConnectionError';
 import type { Job, JobType } from '@/lib/types';
 import {
   activeJobStore,
@@ -80,10 +81,12 @@ export default function JobQueue({ jobType, jobTypesForList }: JobQueueProps) {
         setError(null);
       }
     } catch (e) {
-      console.error('Failed to fetch jobs:', e);
+      // A handled outage should not open Next.js's development error overlay.
+      console.warn('Failed to fetch jobs:', e);
       if (seq === fetchSeq.current) {
         setError(
-          'Could not load jobs from the Studio API. Check the server and try again.',
+          e instanceof ApiConnectionError ? e.message :
+            'Could not load jobs from the Studio API. Check the server and try again.',
         );
       }
     } finally {
@@ -106,17 +109,17 @@ export default function JobQueue({ jobType, jobTypesForList }: JobQueueProps) {
     fetchJobs();
   }, [fetchJobs, nonce]);
 
-  // Poll every second while any job is running/pending; stop otherwise.
+  // Poll active jobs; recover an outage at a slower cadence, including an initial failure.
   const hasActive = jobs.some(
     (j) => j.status === 'running' || j.status === 'pending',
   );
   React.useEffect(() => {
-    if (!hasActive) return;
+    if (!hasActive && !error) return;
     const interval = setInterval(() => {
       if (!inFlight.current) fetchJobsRef.current();
-    }, 1000);
+    }, error ? 5000 : 1000);
     return () => clearInterval(interval);
-  }, [hasActive]);
+  }, [hasActive, error]);
 
   // Keep the active job in sync with the selected id, and void the selection
   // if its job disappeared (e.g. deleted). Skip the store write when nothing
@@ -161,7 +164,8 @@ export default function JobQueue({ jobType, jobTypesForList }: JobQueueProps) {
                 className="size-6 text-destructive"
                 aria-hidden
               />
-              <p className="max-w-md text-sm text-muted-foreground">{error}</p>
+              <p className="max-w-md break-words text-sm text-muted-foreground">{error} Retrying automatically.</p>
+              <a href="/settings" className="text-sm text-accent-blue underline">API settings</a>
               <Button type="button" variant="outline" onClick={fetchJobs}>
                 Try Again
               </Button>
@@ -174,7 +178,8 @@ export default function JobQueue({ jobType, jobTypesForList }: JobQueueProps) {
                   className="mb-3 rounded-lg border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm text-foreground"
                 >
                   Job updates are temporarily unavailable. Showing the most
-                  recent results.
+                  recent results. Retrying automatically.
+                  <span className="block break-words">{error}</span>
                 </p>
               )}
               {jobs.length === 0 ? (

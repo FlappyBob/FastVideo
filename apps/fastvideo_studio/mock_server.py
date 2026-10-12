@@ -164,11 +164,43 @@ def _build_mock_media(kind: str) -> str:
 
 # --- Job helpers ------------------------------------------------------------
 
+# Fixture catalogue mirrors core backend names without importing GPU modules.
+_MOCK_ATTENTION_BACKENDS = (
+    "FLASH_ATTN",
+    "TORCH_SDPA",
+    "SAGE_ATTN",
+    "SAGE_ATTN_THREE",
+    "ATTN_QAT_INFER",
+    "ATTN_QAT_TRAIN",
+    "VIDEO_SPARSE_ATTN",
+    "VIDEO_SPARSE_ATTN_H3",
+    "BSA_ATTN",
+    "VMOBA_ATTN",
+    "SLA_ATTN",
+    "SAGE_SLA_ATTN",
+    "NABLA_ATTN",
+    "NO_ATTENTION",
+)
+
+
+def _attention_updates(updates: dict[str, Any]) -> dict[str, Any]:
+    updates = dict(updates)
+    backend = updates.get("attention_backend")
+    if backend is not None:
+        if not isinstance(backend, str) or backend.strip().upper() not in _MOCK_ATTENTION_BACKENDS:
+            raise HTTPException(status_code=400, detail="Unknown attention backend")
+        updates["attention_backend"] = backend.strip().upper()
+    tile = updates.get("vsa_tile_size")
+    if tile is not None and (isinstance(tile, bool) or not isinstance(tile, int) or tile <= 0):
+        raise HTTPException(status_code=400, detail="vsa_tile_size must be a positive integer")
+    return updates
+
 
 def _new_job_dict(req: CreateJobRequest) -> dict[str, Any]:
     """Build a job dict (mirrors job_runner.Job.to_dict()) in the pending state."""
     job_id = str(uuid.uuid4())
     return {
+        **req.model_dump(),
         "id": job_id,
         "model_id": req.model_id,
         "prompt": req.prompt,
@@ -393,7 +425,7 @@ def update_settings(settings: SettingsUpdate) -> dict[str, Any]:
 @app.get("/api/inference-options")
 def inference_options(model_id: str = "", workload_type: str = "t2v") -> dict[str, Any]:
     return {
-        "attention_backends": ["TORCH_SDPA", "FLASH_ATTN", "VIDEO_SPARSE_ATTN_H3"],
+        "attention_backends": list(_MOCK_ATTENTION_BACKENDS),
         "defaults": {},
         "source": None,
         "auto_attention_backend": None,
@@ -477,12 +509,44 @@ def get_job(job_id: str) -> dict[str, Any]:
 
 @app.post("/api/jobs", status_code=201)
 def create_job(req: CreateJobRequest) -> dict[str, Any]:
+    req = CreateJobRequest(**_attention_updates(req.model_dump()))
     job = _new_job_dict(req)
     with _state_lock:
         _jobs[job["id"]] = job
         if _settings.get("autoStartJob"):
             _start(job)
         return _public_job(job)
+
+
+@app.patch("/api/jobs/{job_id}")
+def edit_job(job_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    with _state_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        _advance_job(job)
+        if job["status"] not in ("pending", "failed", "stopped"):
+            raise HTTPException(status_code=400, detail="Only pending, failed or stopped jobs can be edited")
+        if set(updates) - set(CreateJobRequest.model_fields):
+            raise HTTPException(status_code=400, detail="Unknown or non-editable job field")
+        updates = _attention_updates(updates)
+        try:
+            validated = CreateJobRequest(**{**job, **updates}).model_dump()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        job.update({key: validated[key] for key in updates})
+        return _public_job(job)
+
+
+@app.post("/api/jobs/{job_id}/duplicate", status_code=201)
+def duplicate_job(job_id: str) -> dict[str, Any]:
+    with _state_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        copied = _new_job_dict(CreateJobRequest(**job))
+        _jobs[copied["id"]] = copied
+        return _public_job(copied)
 
 
 def _start(job: dict[str, Any]) -> None:

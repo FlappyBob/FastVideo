@@ -5,6 +5,7 @@ import {
 	loadDefaultOptions,
 	type DefaultOptions,
 } from "./defaultOptions";
+import { ApiConnectionError } from "./apiConnectionError";
 import type { Job, JobType } from "./types";
 
 const DEFAULT_API_BASE_URL = "http://localhost:8189/api";
@@ -279,9 +280,14 @@ export async function getJobsList(jobType?: JobType): Promise<Job[]> {
 	const url = jobType
 		? `${baseApiUrl}/jobs?job_type=${encodeURIComponent(jobType)}`
 		: `${baseApiUrl}/jobs`;
-	const response = await fetch(url);
+	let response: Response;
+	try {
+		response = await fetch(url);
+	} catch {
+		throw new ApiConnectionError(url);
+	}
 	if (!response.ok) {
-		throw new Error("Failed to fetch jobs");
+		throw new Error(`Failed to fetch jobs (HTTP ${response.status}) from ${url}`);
 	}
 	return response.json();
 }
