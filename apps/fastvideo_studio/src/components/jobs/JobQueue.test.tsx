@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import JobQueue from '@/components/jobs/JobQueue';
 import { getJobsList } from '@/lib/api';
@@ -119,4 +119,54 @@ describe('JobQueue', () => {
     act(() => triggerRefresh());
     await waitFor(() => expect(getJobsList).toHaveBeenCalledTimes(2));
   });
+});
+
+
+afterEach(() => vi.useRealTimers());
+
+it('recovers the initial connection failure without a page reload', async () => {
+  vi.useFakeTimers();
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+  vi.mocked(getJobsList).mockRejectedValueOnce(new TypeError('Failed to fetch'));
+  render(<JobQueue jobType="inference" />);
+  await act(async () => {});
+  expect(screen.getByRole('alert')).toBeInTheDocument();
+  expect(screen.queryByText(/No inference jobs yet/)).not.toBeInTheDocument();
+  await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+  expect(getJobsList).toHaveBeenCalledTimes(2);
+  expect(screen.getByText(/No inference jobs yet/)).toBeInTheDocument();
+  expect(consoleError).not.toHaveBeenCalled();
+});
+
+it('keeps cached jobs during a connection failure and stops retries after unmount', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(console, 'error').mockImplementation(() => {});
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+  vi.mocked(getJobsList).mockResolvedValueOnce([makeJob({ model_id: 'Cached result' })]);
+  const view = render(<JobQueue jobType="inference" />);
+  await act(async () => {});
+  vi.mocked(getJobsList).mockRejectedValueOnce(new TypeError('Failed to fetch'));
+  await act(async () => { triggerRefresh(); });
+  expect(screen.getByText('Cached result')).toBeInTheDocument();
+  expect(screen.getByRole('status')).toHaveTextContent(/temporarily unavailable/);
+  vi.mocked(getJobsList).mockResolvedValueOnce([makeJob({ model_id: 'Recovered result' })]);
+  await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+  expect(screen.getByText('Recovered result')).toBeInTheDocument();
+  view.unmount();
+  const calls = vi.mocked(getJobsList).mock.calls.length;
+  await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+  expect(getJobsList).toHaveBeenCalledTimes(calls);
+});
+
+it('cancels an active outage retry when the queue unmounts', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+  vi.mocked(getJobsList).mockRejectedValue(new TypeError('Failed to fetch'));
+  const view = render(<JobQueue jobType="inference" />);
+  await act(async () => {});
+  expect(screen.getByRole('alert')).toBeInTheDocument();
+  view.unmount();
+  await act(async () => { await vi.advanceTimersByTimeAsync(20000); });
+  expect(getJobsList).toHaveBeenCalledTimes(1);
 });

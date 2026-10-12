@@ -129,3 +129,26 @@ migrate to Auto for both backend and tile size. For a matching T2V recipe,
 previously unset attention fields now resolve from that recipe at execution.
 
 ![Per-job attention settings](../../docs/assets/studio-attention-settings.png)
+
+## Remote development and API connection failures
+
+The browser calls the API directly. If Studio runs on a remote machine, forward
+both the web port and API port from your own computer, for example:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:3000:127.0.0.1:3000 \
+  -L 127.0.0.1:8189:127.0.0.1:8189 user@server
+```
+
+Replace these ports when running a second instance (for example 3001/8191).
+Open `http://127.0.0.1:8189/api/jobs` in the same browser: it must return JSON.
+A working web page alone does not verify the API tunnel. Set **API Server Base
+URL** in Settings to the forwarded API URL, including `/api`. This per-browser
+setting overrides `NEXT_PUBLIC_API_BASE_URL`; check it when switching instances.
+
+The queue shows the failing request URL on a transport error, retains cached
+jobs and retries read requests every five seconds until connectivity returns.
+Creating, starting or deleting jobs is never retried automatically. The browser
+connection-recovery tests inject outages and HTTP errors; lifecycle tests cover
+editing, duplicating, starting, stopping and deleting through the mock API.
