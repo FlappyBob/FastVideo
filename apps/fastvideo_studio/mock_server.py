@@ -4,8 +4,8 @@ In-memory mock of the FastVideo Studio API (``server.py``).
 
 This mock implements the same ``/api`` routes and response shapes as the real
 FastAPI server but keeps everything in memory and never touches the FastVideo
-library, a GPU, or a database. It is meant to back the Playwright e2e suite so
-the Next.js frontend can be exercised end-to-end without a real backend.
+library or a GPU. It is meant to back the Playwright e2e suite so the Next.js
+frontend can be exercised end-to-end without a real backend.
 
 Job lifecycle is simulated by recording a start timestamp and *computing* the
 status on read: a started job reports ``running`` for a few seconds and then
@@ -13,14 +13,24 @@ flips to ``completed`` with an ``output_path``, so polling the job list / logs
 shows progression. Generated media is a tiny 1s ``testsrc`` MP4 built lazily
 with ffmpeg and cached.
 
+Pass ``--data-dir`` to seed jobs/datasets/settings from a real server's
+persisted SQLite database instead of the built-in fake demo data, so you can
+browse real job history through the mock without a GPU. This is a read-only
+snapshot taken once at startup: nothing created or changed while the mock
+runs is ever written back to that database, so it's safe to point at the
+same ``--data-dir`` a real ``server.py`` is using.
+
 Usage (from the ``apps/`` directory)::
 
     PYTHONPATH=.. python -m fastvideo_studio.mock_server --port 8190
+    PYTHONPATH=.. python -m fastvideo_studio.mock_server --port 8190 --data-dir ../outputs/ui_data
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
+import logging
 import os
 import random
 import shutil
@@ -29,21 +39,38 @@ import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 
-from fastvideo_studio.database import default_settings_dict
-from fastvideo_studio.models import (CreateDatasetRequest, CreateJobRequest, SettingsUpdate, UpdateCaptionRequest,
-                                     model_label)
+from fastvideo_studio.database import Database, default_settings_dict
+from fastvideo_studio.job_queue import circular_dependency, dependencies, plan_dispatch
+from fastvideo_studio.merge import MergeError, merge_jobs, merged_path
+from fastvideo_studio.trim import BRIGHTNESS_RANGE, CONTRAST_RANGE, SATURATION_RANGE
+from fastvideo_studio.scene_routes import build_scene_router
+from fastvideo_studio.inference_options import inference_options
+from fastvideo.attention.selector import coerce_attn_backend
+
+from fastvideo_studio.models import (CreateDatasetRequest, CreateJobRequest, GradeSegment, MergeSceneRequest,
+                                     QueueJobsRequest, SettingsUpdate, TrimRequest, UpdateCaptionRequest, model_label)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("fastvideo.studio.mock")
 
 # --- Config -----------------------------------------------------------------
 
 # How long a started job stays "running" before it flips to "completed".
 COMPLETE_AFTER_SECONDS = 3.0
 FFMPEG_BIN = shutil.which(os.getenv("FASTVIDEO_FFMPEG_BIN", "ffmpeg"))
+
+# Marks a job dict as a frozen row loaded from a real --data-dir snapshot
+# (see _load_snapshot_from_db) rather than something this process is
+# simulating. Stripped from API responses by _public_job.
+_FROM_SNAPSHOT_KEY = "_from_db_snapshot"
 
 # A small catalogue of fake models keyed by workload type. Mirrors the real
 # server's {id, label} shape (label derived from the HF-style path).
@@ -54,6 +81,10 @@ _MODELS_BY_WORKLOAD: dict[str, list[str]] = {
     ],
     "i2v": [
         "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        # Real registered id (fastvideo/registry.py) -- needed so the frontend's
+        # `modelId.toLowerCase().includes('minimax-h3')` gate (speech-tag
+        # console, references, last-frame upload) actually lights up in the mock.
+        "MiniMaxAI/MiniMax-H3",
     ],
     "t2i": [
         "black-forest-labs/FLUX.1-schnell",
@@ -98,16 +129,77 @@ _mock_media_cache: dict[str, str] = {}
 _mock_media_lock = threading.Lock()
 
 
+def _testsrc_frame(width: int, height: int, index: int):
+    """A cheap, dependency-light stand-in for ffmpeg's `testsrc` pattern:
+    a gradient that shifts over `index` so an encoded clip visibly animates."""
+    import numpy as np
+
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    frame[:, :, 0] = np.linspace(0, 255, width, dtype=np.uint8)[None, :]
+    frame[:, :, 1] = np.linspace(0, 255, height, dtype=np.uint8)[:, None]
+    frame[:, :, 2] = (index * 10) % 256
+    return frame
+
+
+def _build_mock_media_with_pyav(kind: str, path: str) -> None:
+    """ffmpeg isn't installed on every dev box; PyAV (a real FastVideo
+    dependency already, used for reference-video decoding) can encode the
+    same tiny clip directly via its bundled libav, no external binary."""
+    from PIL import Image
+
+    if kind == "png":
+        Image.fromarray(_testsrc_frame(320, 240, 0)).save(path)
+        return
+
+    import av as pyav
+
+    # h264 is what every browser's <video> element actually plays; mpeg4
+    # (MPEG-4 Part 2) is a PyAV-always-has-it fallback that no mainstream
+    # browser decodes, so gallery/job previews would just fail to load.
+    try:
+        pyav.codec.Codec("h264", "w")
+        codec_name = "h264"
+    except Exception:
+        logger.warning("PyAV has no h264 encoder available; falling back to mpeg4, which most "
+                       "browsers cannot play in <video>. Install ffmpeg for real preview playback.")
+        codec_name = "mpeg4"
+
+    container = pyav.open(path, mode="w")
+    try:
+        stream = container.add_stream(codec_name, rate=24)
+        stream.width = 320
+        stream.height = 240
+        stream.pix_fmt = "yuv420p"
+        for i in range(24):  # 1s at 24fps, matching the ffmpeg path's clip length
+            frame = pyav.VideoFrame.from_ndarray(_testsrc_frame(320, 240, i), format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    finally:
+        container.close()
+
+
 def _build_mock_media(kind: str) -> str:
-    """Build (once) a tiny testsrc clip of the given ``kind`` with ffmpeg; cache the path."""
+    """Build (once) a tiny testsrc-like clip of the given ``kind``; cache the path."""
     with _mock_media_lock:
         cached = _mock_media_cache.get(kind)
         if cached and os.path.isfile(cached):
             return cached
-        if not FFMPEG_BIN:
-            raise HTTPException(status_code=500, detail="ffmpeg is required to build mock media")
         fd, path = tempfile.mkstemp(prefix="fvstudio_mock_", suffix=f".{kind}")
         os.close(fd)
+        if not FFMPEG_BIN:
+            try:
+                _build_mock_media_with_pyav(kind, path)
+            except Exception as exc:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+                raise HTTPException(status_code=500,
+                                    detail=f"PyAV fallback failed to build mock {kind}: {exc}") from exc
+            if not os.path.isfile(path) or os.path.getsize(path) == 0:
+                raise HTTPException(status_code=500, detail=f"PyAV fallback produced no mock {kind} bytes")
+            _mock_media_cache[kind] = path
+            return path
         if kind == "png":
             command = [
                 FFMPEG_BIN,
@@ -166,35 +258,34 @@ def _build_mock_media(kind: str) -> str:
 
 
 def _new_job_dict(req: CreateJobRequest) -> dict[str, Any]:
-    """Build a job dict (mirrors job_runner.Job.to_dict()) in the pending state."""
+    """Build a job dict (mirrors job_runner.Job.to_dict()) in the pending state.
+
+    Starts from req.model_dump() rather than re-listing CreateJobRequest's
+    fields by hand -- the previous version silently dropped name,
+    last_image_path, references, and every offload/tuning flag because it
+    was never updated as CreateJobRequest grew those fields. Spreading the
+    request means new fields flow through automatically.
+    """
     job_id = str(uuid.uuid4())
     return {
+        **req.model_dump(),
         "id": job_id,
-        "model_id": req.model_id,
-        "prompt": req.prompt,
         "workload_type": req.workload_type or "t2v",
         "job_type": req.job_type or "inference",
         "image_path": req.image_path or "",
+        "negative_prompt": req.negative_prompt or "",
+        "data_path": req.data_path or "",
         "status": "pending",
         "created_at": time.time(),
+        "queued_at": None,
         "started_at": None,
         "finished_at": None,
         "error": None,
         "output_path": None,
         "log_file_path": None,
-        "num_inference_steps": req.num_inference_steps,
-        "num_frames": req.num_frames,
-        "height": req.height,
-        "width": req.width,
-        "guidance_scale": req.guidance_scale,
-        "guidance_rescale": req.guidance_rescale,
-        "fps": req.fps,
-        "seed": req.seed,
-        "negative_prompt": req.negative_prompt or "",
-        "num_gpus": req.num_gpus,
-        "attention_backend": req.attention_backend,
-        "vsa_tile_size": req.vsa_tile_size,
-        "data_path": req.data_path or "",
+        "edit_start_seconds": 0.0,
+        "edit_end_seconds": None,
+        "edit_segments": [],
         "progress": 0.0,
         "progress_msg": "",
         "phase": "pending",
@@ -206,8 +297,13 @@ def _advance_job(job: dict[str, Any]) -> None:
 
     Status is *computed on read* from the recorded start timestamp, so polling
     the job list / logs naturally shows pending -> running -> completed.
+
+    Jobs loaded from a persisted DB snapshot (``_FROM_SNAPSHOT_KEY``) are a
+    frozen historical record, not something this process is simulating — skip
+    them so a real "pending" or "running" row doesn't silently start ticking
+    toward a fake "completed" just because someone polled it.
     """
-    if job["status"] != "running" or not job.get("started_at"):
+    if job.get(_FROM_SNAPSHOT_KEY) or job["status"] != "running" or not job.get("started_at"):
         return
     elapsed = time.time() - job["started_at"]
     if elapsed >= COMPLETE_AFTER_SECONDS:
@@ -221,9 +317,9 @@ def _advance_job(job: dict[str, Any]) -> None:
 
 
 def _public_job(job: dict[str, Any]) -> dict[str, Any]:
-    """Advance + return a copy safe to serialize."""
+    """Advance + return a copy safe to serialize (internal-only keys stripped)."""
     _advance_job(job)
-    return dict(job)
+    return {k: v for k, v in job.items() if not k.startswith("_")}
 
 
 _LOG_TAIL = [
@@ -254,8 +350,8 @@ def _compute_logs(job: dict[str, Any]) -> dict[str, Any]:
     """Return JobLogs-shaped data, growing the visible lines as time passes."""
     seq = _log_sequence(job)
     status = job["status"]
-    if status == "pending":
-        return {"lines": [], "progress": 0.0, "progress_msg": "", "phase": "pending"}
+    if status in ("pending", "queued"):
+        return {"lines": [], "progress": 0.0, "progress_msg": "", "phase": status}
     if status == "completed":
         return {"lines": seq, "progress": 100.0, "progress_msg": "50/50 steps", "phase": "done"}
     if status in ("failed", "stopped"):
@@ -348,6 +444,84 @@ def _seed() -> None:
     }
 
 
+# --- DB snapshot (--data-dir) ------------------------------------------------
+
+
+def _decode_references(value: Any) -> list[dict[str, Any]]:
+    """Reference lists round-trip through the DB as JSON text."""
+    if not value:
+        return []
+    if isinstance(value, list):
+        return list(value)
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return []
+    return list(decoded) if isinstance(decoded, list) else []
+
+
+def _job_from_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    """Adapt a persisted job row into the mock's job dict shape.
+
+    Frozen as a read-only historical record (see _FROM_SNAPSHOT_KEY): the mock
+    never actually ran this job, so it doesn't get to simulate progress for
+    one. A row still marked "running" is orphaned -- the real JobRunner
+    reclassifies those as failed on its own restart, so mirror that here.
+    """
+    job = dict(row)
+    status = job["status"]
+    if status in ("running", "queued"):
+        status = "failed"
+        job["error"] = job.get("error") or "Server restarted (job was interrupted)"
+        job["finished_at"] = job.get("finished_at") or time.time()
+    job["status"] = status
+    job["references"] = _decode_references(row.get("references"))
+    job["progress"] = 100.0 if status == "completed" else 0.0
+    job["progress_msg"] = "50/50 steps" if status == "completed" else ""
+    job["phase"] = "done" if status == "completed" else status
+    job[_FROM_SNAPSHOT_KEY] = True
+    return job
+
+
+def _load_snapshot_from_db(data_dir: Path) -> bool:
+    """Seed jobs/datasets/settings from a real server's persisted SQLite db.
+
+    Read-only: opens the db (Database.__init__ runs the same idempotent
+    schema migrations a real server startup would) and copies rows into the
+    mock's in-memory state; nothing the mock does afterward is written back.
+    Returns False (leaving the caller to fall back to _seed()) if no db file
+    is found at that path, rather than silently creating an empty one.
+    """
+    db_path = data_dir / "fastvideo_ui.db"
+    if not db_path.is_file():
+        logger.warning("--data-dir %s has no fastvideo_ui.db; falling back to fake demo data.", data_dir)
+        return False
+
+    db = Database(db_path)
+    settings = db.get_settings()
+    jobs = [_job_from_snapshot(row) for row in db.get_all_jobs()]
+    datasets = db.get_all_datasets()
+
+    with _state_lock:
+        _settings.update({k: v for k, v in settings.items() if v is not None})
+        _jobs.clear()
+        _jobs.update({j["id"]: j for j in jobs})
+        _datasets.clear()
+        _datasets.update({d["id"]: d for d in datasets})
+        _dataset_files.clear()
+        for d in datasets:
+            captions = db.get_dataset_captions(d["id"])
+            _dataset_files[d["id"]] = {"file_names": list(captions.keys()), "captions": captions}
+
+    logger.info(
+        "Loaded read-only snapshot from %s: %d job(s), %d dataset(s).",
+        db_path,
+        len(jobs),
+        len(datasets),
+    )
+    return True
+
+
 # --- App --------------------------------------------------------------------
 
 app = FastAPI(title="FastVideo Studio Mock API", version="0.1.0")
@@ -358,8 +532,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-_seed()
 
 
 @app.get("/api/__mock__")
@@ -388,17 +560,6 @@ def update_settings(settings: SettingsUpdate) -> dict[str, Any]:
 
 
 # --- Models -----------------------------------------------------------------
-
-
-@app.get("/api/inference-options")
-def inference_options(model_id: str = "", workload_type: str = "t2v") -> dict[str, Any]:
-    return {
-        "attention_backends": ["TORCH_SDPA", "FLASH_ATTN", "VIDEO_SPARSE_ATTN_H3"],
-        "defaults": {},
-        "source": None,
-        "auto_attention_backend": None,
-        "auto_vsa_tile_size": None
-    }
 
 
 @app.get("/api/models")
@@ -436,6 +597,32 @@ async def upload_image(file: Annotated[UploadFile, File()]) -> dict[str, str]:
     return {"path": f"/mock/uploads/{uuid.uuid4().hex}_{os.path.basename(name)}"}
 
 
+ALLOWED_REFERENCE_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+ALLOWED_REFERENCE_AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".m4a", ".ogg"}
+ALLOWED_REFERENCE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+
+@app.post("/api/upload-media")
+async def upload_media(file: Annotated[UploadFile, File()]) -> dict[str, str]:
+    """Ref2VA reference upload (image/video/audio) -- the real server's
+    counterpart to upload_image, which only ever handles images."""
+    name = file.filename or "reference"
+    ext = os.path.splitext(name)[1].lower()
+    allowed = ALLOWED_REFERENCE_IMAGE_EXTENSIONS | ALLOWED_REFERENCE_VIDEO_EXTENSIONS | ALLOWED_REFERENCE_AUDIO_EXTENSIONS
+    if ext not in allowed:
+        raise HTTPException(status_code=400, detail=f"Invalid file type. Allowed: {', '.join(sorted(allowed))}")
+    if ext in ALLOWED_REFERENCE_VIDEO_EXTENSIONS:
+        media_type = "video"
+    elif ext in ALLOWED_REFERENCE_AUDIO_EXTENSIONS:
+        media_type = "audio"
+    else:
+        media_type = "image"
+    return {
+        "path": f"/mock/uploads/{uuid.uuid4().hex}_{os.path.basename(name)}",
+        "media_type": media_type,
+    }
+
+
 @app.post("/api/upload-raw-dataset")
 async def upload_raw_dataset(files: Annotated[list[UploadFile], File()]) -> dict[str, Any]:
     video_exts = {".mp4", ".webm", ".avi", ".mov", ".mkv"}
@@ -459,6 +646,7 @@ def list_jobs(job_type: str | None = None) -> list[dict[str, Any]]:
     # _public_job mutates the shared job dict via _advance_job, so it must run
     # under the lock (matching every other job route) to avoid racing start/stop.
     with _state_lock:
+        _drain_queue()
         jobs = list(_jobs.values())
         if job_type:
             jobs = [j for j in jobs if j.get("job_type") == job_type]
@@ -469,6 +657,7 @@ def list_jobs(job_type: str | None = None) -> list[dict[str, Any]]:
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str) -> dict[str, Any]:
     with _state_lock:
+        _drain_queue()
         job = _jobs.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found")
@@ -477,17 +666,27 @@ def get_job(job_id: str) -> dict[str, Any]:
 
 @app.post("/api/jobs", status_code=201)
 def create_job(req: CreateJobRequest) -> dict[str, Any]:
+    try:
+        backend = coerce_attn_backend(req.attention_backend)
+        req.attention_backend = backend.name if backend else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     job = _new_job_dict(req)
     with _state_lock:
+        _drain_queue()
         _jobs[job["id"]] = job
         if _settings.get("autoStartJob"):
             _start(job)
         return _public_job(job)
 
 
-def _start(job: dict[str, Any]) -> None:
+def _start(job: dict[str, Any], at: float | None = None) -> None:
+    # Once the mock is actually driving this job, it's no longer a frozen
+    # historical record -- let _advance_job simulate it like any other.
+    job.pop(_FROM_SNAPSHOT_KEY, None)
     job["status"] = "running"
-    job["started_at"] = time.time()
+    job["queued_at"] = None
+    job["started_at"] = at if at is not None else time.time()
     job["finished_at"] = None
     job["error"] = None
     job["output_path"] = None
@@ -499,17 +698,298 @@ def _start(job: dict[str, Any]) -> None:
     job["phase"] = "starting"
 
 
-@app.post("/api/jobs/{job_id}/start")
-def start_job(job_id: str) -> dict[str, Any]:
+class _QueueView:
+    """The scheduler's view of a mock job dict (it reads attributes, not keys)."""
+
+    def __init__(self, job: dict[str, Any]):
+        self.id = job["id"]
+        self.name = job.get("name", "")
+        self.status = job["status"]
+        self.references = job.get("references")
+        self.queued_at = job.get("queued_at")
+
+
+def _drain_queue() -> None:
+    """Run the queue up to now. Call with ``_state_lock`` held.
+
+    Like everything else in the mock this is computed on read: each pass
+    finishes jobs whose time is up, then starts whatever the queue allows.
+    A job takes over the slot at the moment the previous job *finished* (not at
+    the moment someone happened to poll), so a queue that has been sitting for
+    a minute shows every clip already done rather than advancing one per poll.
+    Same rules as the real runner: one at a time, oldest first, and a clip that
+    takes another's last frame waits for it -- see job_queue.plan_dispatch.
+    """
+    while True:
+        for job in _jobs.values():
+            _advance_job(job)
+        plan = plan_dispatch({jid: _QueueView(j) for jid, j in _jobs.items()}, max_concurrent=1)
+        now = time.time()
+        for job_id, reason in plan.fail.items():
+            job = _jobs[job_id]
+            job["status"] = "failed"
+            job["error"] = reason
+            job["finished_at"] = now
+            job["queued_at"] = None
+            job["phase"] = "failed"
+        if not plan.start:
+            if plan.fail:
+                continue  # a failure can free a slot or fail more jobs
+            return
+        for job_id in plan.start:
+            job = _jobs[job_id]
+            finished = [j["finished_at"] for j in _jobs.values() if j.get("finished_at")]
+            # The slot came free when the last job finished, if that was after the job was queued.
+            slot_free = max([job.get("queued_at") or 0.0, *[f for f in finished if f <= now]])
+            _start(job, at=min(now, slot_free))
+
+
+def _check_dependencies_finished(job: dict[str, Any]) -> None:
+    for dep_id in dependencies(job.get("references")):
+        dep = _jobs.get(dep_id)
+        if dep is None:
+            raise HTTPException(status_code=409,
+                                detail="This job starts from the ending of a job that no longer exists.")
+        if dep["status"] != "completed":
+            label = f"'{dep['name']}'" if dep.get("name") else dep["id"]
+            raise HTTPException(
+                status_code=409,
+                detail=(f"This job starts from the ending of {label}, which hasn't finished "
+                        f"(it is {dep['status']}). Queue it to run after that job."),
+            )
+
+
+# Mirrors JobRunner.EDITABLE_STATUSES: exactly the jobs that can still be started.
+_EDITABLE_STATUSES = ("pending", "failed", "stopped")
+
+
+@app.patch("/api/jobs/{job_id}")
+def update_job(job_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    """Edit a job's configuration; only jobs that have not produced a result."""
     with _state_lock:
+        _drain_queue()
         job = _jobs.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
         _advance_job(job)
-        if job["status"] == "running":
-            raise HTTPException(status_code=409, detail="Job is already running")
-        if job["status"] == "completed":
-            raise HTTPException(status_code=409, detail="Job already completed. Delete and re-create to run again.")
+        if job["status"] not in _EDITABLE_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Job is {job['status']}; only {', '.join(_EDITABLE_STATUSES)} jobs can be edited. "
+                        "Duplicate it instead."),
+            )
+        unknown = set(updates) - set(CreateJobRequest.model_fields)
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"Not editable: {', '.join(sorted(unknown))}")
+        try:
+            updates = dict(updates)
+            if "attention_backend" in updates:
+                backend = coerce_attn_backend(updates["attention_backend"])
+                updates["attention_backend"] = backend.name if backend else None
+            fields = {key: job[key] for key in CreateJobRequest.model_fields if key in job}
+            validated = CreateJobRequest(**{**fields, **updates}).model_dump()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        job.update({key: validated[key] for key in updates})
+        return _public_job(job)
+
+
+@app.post("/api/jobs/{job_id}/last-frame")
+def extract_last_frame(job_id: str) -> dict[str, str]:
+    """Stand-in for the real route: there is no video to read, so hand back a made-up path."""
+    with _state_lock:
+        _drain_queue()
+        job = _jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        _advance_job(job)
+        if job["status"] != "completed" or not job.get("output_path"):
+            raise HTTPException(status_code=404, detail="No output available for this job")
+    return {"path": f"/mock/last_frames/last_frame_{job_id}.png", "media_type": "image"}
+
+
+@app.post("/api/jobs/{job_id}/last-clip")
+def extract_last_clip(job_id: str) -> dict[str, str]:
+    """Stand-in for the real route: there is no video to read, so hand back a made-up path."""
+    with _state_lock:
+        _drain_queue()
+        job = _jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        _advance_job(job)
+        if job["status"] != "completed" or not job.get("output_path"):
+            raise HTTPException(status_code=404, detail="No output available for this job")
+    return {"path": f"/mock/last_clips/last_clip_{job_id}.mp4", "media_type": "video"}
+
+
+#: Key holding a trimmed job's frame count before any trim, so it can be restored.
+_ORIGINAL_NUM_FRAMES_KEY = "_original_num_frames"
+
+
+def _trimmable_job(job_id: str) -> dict[str, Any]:
+    """Look up a completed job with an output, or raise. Call with _state_lock held."""
+    _drain_queue()
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    _advance_job(job)
+    if job["status"] != "completed" or not job.get("output_path"):
+        raise HTTPException(status_code=404, detail="No output available for this job")
+    return job
+
+
+def _check_grade_range(name: str, value: float, bounds: tuple[float, float]) -> None:
+    low, high = bounds
+    if not (low <= value <= high):
+        raise HTTPException(status_code=400, detail=f"{name} must be between {low:g} and {high:g}, got {value:g}.")
+
+
+def _check_segments(segments: list[GradeSegment]) -> None:
+    """Structural checks only (ordering, open-endedness, color bounds) -- the mock has no
+    frames to count, so it doesn't reproduce trim.py's frame-rounding/coverage checks.
+
+    An empty list isn't an error here either, matching trim.py: it defaults to
+    one neutral section covering everything (Pydantic's own default_factory
+    already supplies that when the field is omitted, but an explicit "segments":
+    [] reaches here as a real empty list).
+    """
+    prev_end = 0.0
+    for i, s in enumerate(segments):
+        _check_grade_range("brightness", s.brightness, BRIGHTNESS_RANGE)
+        _check_grade_range("contrast", s.contrast, CONTRAST_RANGE)
+        _check_grade_range("saturation", s.saturation, SATURATION_RANGE)
+        if s.end_seconds is None:
+            if i != len(segments) - 1:
+                raise HTTPException(status_code=400, detail="Only the last section can be open-ended.")
+        else:
+            if s.end_seconds <= prev_end:
+                raise HTTPException(status_code=400, detail="Sections must be in increasing order.")
+            prev_end = s.end_seconds
+
+
+@app.post("/api/jobs/{job_id}/trim")
+def trim_job(job_id: str, req: TrimRequest) -> dict[str, Any]:
+    """Stand-in for the real route: no video to cut or grade, so just resize num_frames to match."""
+    with _state_lock:
+        job = _trimmable_job(job_id)
+        if req.start_seconds < 0:
+            raise HTTPException(status_code=400, detail="The start of the range can't be negative.")
+        _check_segments(req.segments)
+        fps = job.get("fps") or 24
+        original_frames = job.setdefault(_ORIGINAL_NUM_FRAMES_KEY, job["num_frames"])
+        duration = original_frames / fps
+        end = duration if req.end_seconds is None else min(req.end_seconds, duration)
+        if end <= req.start_seconds:
+            raise HTTPException(status_code=400, detail="The end of the range must come after the start.")
+        job["num_frames"] = max(1, round((end - req.start_seconds) * fps))
+        # Recorded so the dialog can reopen showing what's actually applied,
+        # like the real server's edit_* job fields.
+        job["edit_start_seconds"] = req.start_seconds
+        job["edit_end_seconds"] = req.end_seconds
+        job["edit_segments"] = [s.model_dump() for s in req.segments]
+        return _public_job(job)
+
+
+@app.post("/api/jobs/{job_id}/restore-video")
+def restore_job_video(job_id: str) -> dict[str, Any]:
+    """Stand-in for the real route: undo the simulated edit by restoring num_frames."""
+    with _state_lock:
+        job = _trimmable_job(job_id)
+        if _ORIGINAL_NUM_FRAMES_KEY not in job:
+            raise HTTPException(status_code=404, detail="This job has not been edited.")
+        job["num_frames"] = job.pop(_ORIGINAL_NUM_FRAMES_KEY)
+        job["edit_start_seconds"] = 0.0
+        job["edit_end_seconds"] = None
+        job["edit_segments"] = []
+        return _public_job(job)
+
+
+def _check_startable(job: dict[str, Any]) -> None:
+    if job["status"] == "running":
+        raise HTTPException(status_code=409, detail="Job is already running")
+    if job["status"] == "queued":
+        raise HTTPException(status_code=409, detail="Job is already queued")
+    if job["status"] == "completed":
+        raise HTTPException(status_code=409, detail="Job already completed. Delete and re-create to run again.")
+
+
+def _enqueue(job_ids: list[str]) -> list[dict[str, Any]]:
+    """Queue jobs in order, all-or-nothing (mirrors JobRunner.enqueue_jobs). Lock held."""
+    if len(set(job_ids)) != len(job_ids):
+        raise HTTPException(status_code=409, detail="A job was listed more than once.")
+    jobs = []
+    for job_id in job_ids:
+        job = _jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        _check_startable(job)
+        jobs.append(job)
+    views = {jid: _QueueView(j) for jid, j in _jobs.items()}
+    for job in jobs:
+        loop = circular_dependency(views, job["id"])
+        if loop:
+            raise HTTPException(
+                status_code=409,
+                detail="Jobs would wait on each other's last frames in a loop: " + " -> ".join(loop),
+            )
+    for job in jobs:
+        job.pop(_FROM_SNAPSHOT_KEY, None)
+        job.update(status="queued",
+                   queued_at=time.time(),
+                   error=None,
+                   output_path=None,
+                   log_file_path=None,
+                   started_at=None,
+                   finished_at=None,
+                   progress=0.0,
+                   progress_msg="",
+                   phase="queued")
+        # Strictly increasing, so jobs queued together keep their order.
+        others = [j["queued_at"] for j in _jobs.values() if j.get("queued_at") and j is not job]
+        job["queued_at"] = max([job["queued_at"], *[o + 1e-6 for o in others]])
+    _drain_queue()
+    return [_public_job(j) for j in jobs]
+
+
+@app.post("/api/jobs/queue")
+def queue_jobs(req: QueueJobsRequest) -> list[dict[str, Any]]:
+    with _state_lock:
+        _drain_queue()
+        return _enqueue(req.job_ids)
+
+
+@app.post("/api/jobs/{job_id}/queue")
+def queue_job(job_id: str) -> dict[str, Any]:
+    with _state_lock:
+        _drain_queue()
+        return _enqueue([job_id])[0]
+
+
+@app.post("/api/jobs/{job_id}/dequeue")
+def dequeue_job(job_id: str) -> dict[str, Any]:
+    with _state_lock:
+        _drain_queue()
+        job = _jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        if job["status"] != "queued":
+            raise HTTPException(status_code=409, detail=f"Job is not queued (status={job['status']})")
+        job["status"] = "pending"
+        job["queued_at"] = None
+        _drain_queue()
+        return _public_job(job)
+
+
+@app.post("/api/jobs/{job_id}/start")
+def start_job(job_id: str) -> dict[str, Any]:
+    with _state_lock:
+        _drain_queue()
+        job = _jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        _advance_job(job)
+        _check_startable(job)
+        _check_dependencies_finished(job)
         _start(job)
         return _public_job(job)
 
@@ -517,10 +997,16 @@ def start_job(job_id: str) -> dict[str, Any]:
 @app.post("/api/jobs/{job_id}/stop")
 def stop_job(job_id: str) -> dict[str, Any]:
     with _state_lock:
+        _drain_queue()
         job = _jobs.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
         _advance_job(job)
+        if job["status"] == "queued":
+            job["status"] = "pending"
+            job["queued_at"] = None
+            _drain_queue()
+            return _public_job(job)
         if job["status"] != "running":
             raise HTTPException(status_code=409, detail=f"Job is not running (status={job['status']})")
         job["status"] = "stopped"
@@ -532,14 +1018,17 @@ def stop_job(job_id: str) -> dict[str, Any]:
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: str) -> dict[str, str]:
     with _state_lock:
+        _drain_queue()
         if _jobs.pop(job_id, None) is None:
             raise HTTPException(status_code=404, detail="Job not found")
+        _drain_queue()  # clips waiting on this one's last frame can no longer run
     return {"detail": f"Job {job_id} deleted"}
 
 
 @app.get("/api/jobs/{job_id}/logs")
 def get_job_logs(job_id: str, after: int = 0) -> dict[str, Any]:
     with _state_lock:
+        _drain_queue()
         job = _jobs.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
@@ -558,6 +1047,7 @@ def get_job_logs(job_id: str, after: int = 0) -> dict[str, Any]:
 @app.get("/api/jobs/{job_id}/video")
 def get_video(job_id: str) -> FileResponse:
     with _state_lock:
+        _drain_queue()
         job = _jobs.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found")
@@ -565,6 +1055,12 @@ def get_video(job_id: str) -> FileResponse:
         output_path = job.get("output_path")
         if job["status"] != "completed" or not output_path:
             raise HTTPException(status_code=404, detail="No output available for this job")
+    # A job loaded from a --data-dir snapshot may point at a real file this
+    # process never wrote, only reads -- serve it if it's actually there,
+    # otherwise fall back to the same synthetic clip every other job gets.
+    if os.path.isfile(output_path):
+        media_type = "video/mp4" if output_path.endswith(".mp4") else "image/png"
+        return FileResponse(output_path, media_type=media_type, filename=os.path.basename(output_path))
     # Mirror the real server: image workloads (t2i) output a .png served as an
     # image; everything else is a video.
     if output_path.endswith(".png"):
@@ -572,9 +1068,59 @@ def get_video(job_id: str) -> FileResponse:
     return FileResponse(_build_mock_media("mp4"), media_type="video/mp4", filename=f"job_{job_id}.mp4")
 
 
+_MERGED_DIR = tempfile.mkdtemp(prefix="fvstudio_merged_")
+
+
+@app.post("/api/scenes/merge")
+def merge_scene(req: MergeSceneRequest) -> dict[str, Any]:
+    """Real merge (same code as the real server) of whatever videos the jobs have.
+
+    Jobs whose video only exists in the mock get the stand-in clip, so the
+    flow can be tried end to end without generating anything.
+    """
+    with _state_lock:
+        _drain_queue()
+        picked = []
+        for job_id in req.job_ids:
+            job = _jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+            picked.append(dict(job))
+    all_real = all(j.get("output_path") and os.path.isfile(j["output_path"]) for j in picked)
+    stand_in = None if all_real else _build_mock_media("mp4")
+    jobs = [
+        SimpleNamespace(
+            id=j["id"],
+            name=j.get("name", ""),
+            status=j["status"],
+            output_path=(j["output_path"] if all_real else (stand_in if j["status"] == "completed" else None)),
+        ) for j in picked
+    ]
+    try:
+        result = merge_jobs(jobs, _MERGED_DIR, req.name)
+    except MergeError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+    return {
+        "filename": result.filename,
+        "url": f"/api/merged/{result.filename}",
+        "clips": result.clips,
+        "seconds": result.seconds,
+    }
+
+
+@app.get("/api/merged/{filename}")
+def get_merged_video(filename: str) -> FileResponse:
+    try:
+        path = merged_path(_MERGED_DIR, filename)
+    except MergeError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+    return FileResponse(path, media_type="video/mp4", filename=filename)
+
+
 @app.get("/api/jobs/{job_id}/download_log")
 def download_log(job_id: str) -> PlainTextResponse:
     with _state_lock:
+        _drain_queue()
         job = _jobs.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found")
@@ -664,9 +1210,28 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     # Default off the real server's 8189 so the mock never shadows a real API.
     parser.add_argument("--port", type=int, default=8190, help="Port number (default: 8190)")
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help=("Read-only: seed jobs/datasets/settings from a real server's "
+              "fastvideo_ui.db under this directory (its --data-dir) instead "
+              "of fake demo data. Nothing the mock does is written back."),
+    )
     args = parser.parse_args()
 
+    if args.data_dir is None or not _load_snapshot_from_db(Path(args.data_dir).resolve()):
+        _seed()
+
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
+_scene_db = Database(Path(tempfile.mkdtemp(prefix="studio-mock-scenes-")) / "scenes.db")
+app.include_router(build_scene_router(lambda: _scene_db, lambda: list(_jobs.values())))
+
+
+@app.get("/api/inference-options")
+def get_inference_options(model_id: str = ""):
+    return inference_options(model_id)
 
 
 if __name__ == "__main__":

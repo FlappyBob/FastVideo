@@ -186,3 +186,30 @@ def test_transformer_checkpoint_staging_policy(
         fsdp_inference=fsdp_inference,
         has_unified_memory=has_unified_memory,
     ) is expected
+
+
+def test_explicit_cpu_load_does_not_stage_full_checkpoint_on_gpu(monkeypatch) -> None:
+    """H3 layerwise offload disables whole-model offload but loads to CPU."""
+    class StagingObserved(Exception):
+        pass
+
+    def observe_iterator(_paths, *, to_cpu):
+        assert to_cpu is True, "CPU target must not stage the checkpoint on CUDA"
+        raise StagingObserved
+
+    monkeypatch.setattr(fsdp_load, "safetensors_weights_iterator", observe_iterator)
+    with pytest.raises(StagingObserved):
+        fsdp_load.maybe_load_fsdp_model(
+            model_cls=_TinyModel,
+            init_params={},
+            weight_dir_list=[],
+            device=torch.device("cpu"),
+            hsdp_replicate_dim=1,
+            hsdp_shard_dim=1,
+            default_dtype=torch.bfloat16,
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            cpu_offload=False,
+            fsdp_inference=False,
+            training_mode=False,
+        )

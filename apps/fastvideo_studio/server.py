@@ -34,11 +34,14 @@ from fastapi.responses import FileResponse
 from fastvideo.registry import (get_registered_model_paths, get_registered_models_with_workloads)
 from fastvideo_studio.database import Database, _get_db_path
 from fastvideo_studio.gpu import get_gpu_snapshot
+from fastvideo_studio.frames import FrameError, last_clip_for_job, last_frame_for_job
+from fastvideo_studio.merge import MergeError, merge_jobs, merged_path
+from fastvideo_studio.scene_routes import build_scene_router
 from fastvideo_studio.job_runner import JobRunner, JobStatus
 from fastvideo_studio.inference_options import inference_options
 from fastvideo.attention.selector import coerce_attn_backend
-from fastvideo_studio.models import (CreateDatasetRequest, CreateJobRequest, SettingsUpdate, UpdateCaptionRequest,
-                                     model_label)
+from fastvideo_studio.models import (CreateDatasetRequest, CreateJobRequest, MergeSceneRequest, QueueJobsRequest,
+                                     TrimRequest, SettingsUpdate, UpdateCaptionRequest, model_label)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -678,6 +681,148 @@ def get_video(job_id: str) -> FileResponse:
     return FileResponse(job.output_path, media_type=media_type)
 
 
+def _queue_error(error: ValueError) -> HTTPException:
+    return HTTPException(status_code=404 if "not found" in str(error) else 409, detail=str(error))
+
+
+@app.post("/api/jobs/queue")
+def queue_jobs(req: QueueJobsRequest) -> list[dict[str, Any]]:
+    """Queue jobs, in the order given, to run as GPU slots free up.
+
+    A job that starts from another job's last frame waits for that job to
+    complete. All-or-nothing: if any job can't be queued, none are.
+    """
+    try:
+        return [j.to_dict() for j in job_runner.enqueue_jobs(req.job_ids)]
+    except ValueError as e:
+        raise _queue_error(e) from e
+
+
+@app.post("/api/jobs/{job_id}/queue")
+def queue_job(job_id: str) -> dict[str, Any]:
+    """Queue one job to run when a slot is free."""
+    try:
+        return job_runner.enqueue_job(job_id).to_dict()
+    except ValueError as e:
+        raise _queue_error(e) from e
+
+
+@app.post("/api/jobs/{job_id}/dequeue")
+def dequeue_job(job_id: str) -> dict[str, Any]:
+    """Take a queued job out of the queue (back to pending)."""
+    try:
+        return job_runner.dequeue_job(job_id).to_dict()
+    except ValueError as e:
+        raise _queue_error(e) from e
+
+
+@app.post("/api/jobs/{job_id}/last-frame")
+def extract_last_frame(job_id: str) -> dict[str, str]:
+    """Save the last frame of a completed job's video and return its path.
+
+    The path is meant to be attached to another job as an image reference, so
+    the next clip of a scene can start from where this one ended.
+    """
+    job = job_runner.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    try:
+        path = last_frame_for_job(job, upload_dir)
+    except FrameError as e:
+        if e.status_code >= 500:
+            logger.warning("Last-frame extraction failed for job %s: %s", job_id, e.detail)
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+    return {"path": path, "media_type": "image"}
+
+
+@app.post("/api/jobs/{job_id}/last-clip")
+def extract_last_clip(job_id: str) -> dict[str, str]:
+    """Save the trailing second of a completed job's video and return its path.
+
+    The path is meant to be attached to another job as a video reference, so
+    the next clip continues with real motion instead of guessing it from a
+    single still frame.
+    """
+    job = job_runner.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    try:
+        path = last_clip_for_job(job, upload_dir)
+    except FrameError as e:
+        if e.status_code >= 500:
+            logger.warning("Last-clip extraction failed for job %s: %s", job_id, e.detail)
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+    return {"path": path, "media_type": "video"}
+
+
+def _trim_error(e: Exception) -> HTTPException:
+    if isinstance(e, FrameError):
+        return HTTPException(status_code=e.status_code, detail=e.detail)
+    return HTTPException(status_code=404 if "not found" in str(e) else 400, detail=str(e))
+
+
+@app.post("/api/jobs/{job_id}/trim")
+def trim_job(job_id: str, req: TrimRequest) -> dict[str, Any]:
+    """Cut a completed job's video to [start_seconds, end_seconds) and grade it section by section, in place.
+
+    The untouched original is kept, so this can be called again with a
+    different range and/or sections, or undone with POST .../restore-video.
+    """
+    try:
+        segments = [s.model_dump() for s in req.segments]
+        job = job_runner.trim_job(job_id, req.start_seconds, req.end_seconds, segments)
+    except (ValueError, FrameError) as e:
+        raise _trim_error(e) from e
+    return job.to_dict()
+
+
+@app.post("/api/jobs/{job_id}/restore-video")
+def restore_job_video(job_id: str) -> dict[str, Any]:
+    """Undo every trim on a job's video, back to what it originally generated."""
+    try:
+        job = job_runner.restore_job_video(job_id)
+    except (ValueError, FrameError) as e:
+        raise _trim_error(e) from e
+    return job.to_dict()
+
+
+@app.post("/api/scenes/merge")
+def merge_scene(req: MergeSceneRequest) -> dict[str, Any]:
+    """Join the finished clips of a scene, in the order given, into one video.
+
+    The clips are copied, not re-encoded, so this takes about a second.
+    """
+    jobs = []
+    for job_id in req.job_ids:
+        job = job_runner.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        jobs.append(job)
+    try:
+        result = merge_jobs(jobs, job_runner.output_dir, req.name)
+    except MergeError as e:
+        if e.status_code >= 500:
+            logger.warning("Scene merge failed: %s", e.detail)
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+    logger.info("Merged %d clips into %s", result.clips, result.path)
+    return {
+        "filename": result.filename,
+        "url": f"/api/merged/{result.filename}",
+        "clips": result.clips,
+        "seconds": result.seconds,
+    }
+
+
+@app.get("/api/merged/{filename}")
+def get_merged_video(filename: str) -> FileResponse:
+    """Stream a merged scene video."""
+    try:
+        path = merged_path(job_runner.output_dir, filename)
+    except MergeError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+    return FileResponse(path, media_type="video/mp4", filename=filename)
+
+
 @app.get("/api/jobs/{job_id}/download_log")
 def get_job_log_file(job_id: str) -> FileResponse:
     """Download the log file for a job."""
@@ -788,6 +933,7 @@ def main() -> None:
         log_dir=log_dir,
         verbose=args.verbose,
         database=database,
+        upload_dir=upload_dir,
     )
 
     logger.info("Output directory: %s", output_dir)
@@ -803,6 +949,9 @@ def main() -> None:
     finally:
         job_runner._shutdown()
 
+
+app.include_router(
+    build_scene_router(lambda: database, lambda: [j.to_dict() for j in job_runner.list_jobs("inference")]))
 
 if __name__ == "__main__":
     main()

@@ -17,13 +17,13 @@ import logging
 import logging.handlers
 import multiprocessing as mp
 import os
-import queue
 import re
 import signal
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -32,6 +32,10 @@ import yaml
 from fastvideo.utils import get_mp_context
 from fastvideo.attention.selector import coerce_attn_backend, get_env_variable_attn_backend
 from fastvideo_studio.database import Database
+from fastvideo_studio.job_queue import circular_dependency, dependencies, plan_dispatch, resolve_references
+from fastvideo_studio.frames import last_frame_for_job, last_clip_for_job
+from fastvideo_studio.trim import trim_video, restore_original
+from fastvideo_studio.media import media_lock
 from fastvideo_studio.inference_options import resolve_attention_defaults
 from fastvideo_studio.models import CreateJobRequest
 from fastvideo_studio.training_config import (
@@ -145,6 +149,11 @@ class Job:
     finished_at: float | None = None
     error: str | None = None
     output_path: str | None = None
+    queued_at: float | None = None
+    original_num_frames: int | None = None
+    edit_start_seconds: float = 0.0
+    edit_end_seconds: float | None = None
+    edit_segments: list[dict[str, Any]] = field(default_factory=list)
     log_file_path: str | None = None  # Path to the job's log file
     num_inference_steps: int = 50
     num_frames: int = 81
@@ -204,6 +213,10 @@ class Job:
             "references": self.references,
             "status": self.status.value,
             "created_at": self.created_at,
+            "queued_at": self.queued_at,
+            "edit_start_seconds": self.edit_start_seconds,
+            "edit_end_seconds": self.edit_end_seconds,
+            "edit_segments": self.edit_segments,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "error": self.error,
@@ -331,6 +344,7 @@ class JobRunner:
         log_dir: str,
         database: Database,
         verbose: bool = False,
+        upload_dir: str = "",
     ):
         """Initialize the job runner.
 
@@ -343,17 +357,20 @@ class JobRunner:
         self.output_dir = output_dir
         self.log_dir = log_dir
         self.verbose = verbose
+        self.upload_dir = upload_dir or os.path.join(output_dir, "uploads")
         self._db = database
 
         self._jobs: dict[str, Job] = {}
-        self._jobs_lock = threading.Lock()
+        self._jobs_lock = threading.RLock()
+        self._condition = threading.Condition(self._jobs_lock)
+        self._last_queued_at = 0.0
+        self._editing_media: set[str] = set()
         self._load_jobs()
 
         # Cache of loaded generators keyed by model config so that we only pay
         # the model-loading cost once per model configuration.
         self._generators: dict[tuple, Any] = {}
         self._generators_lock = threading.Lock()
-        self._queue: queue.Queue[tuple[Job, threading.Event] | None] = queue.Queue()
         self._closed = False
         self._active_job: Job | None = None
         self._worker = threading.Thread(target=self._serve_jobs, name="studio-jobs", daemon=True)
@@ -437,6 +454,11 @@ class JobRunner:
                     error=row.get("error"),
                     output_path=row.get("output_path"),
                     log_file_path=row.get("log_file_path"),
+                    queued_at=row.get("queued_at"),
+                    original_num_frames=row.get("original_num_frames"),
+                    edit_start_seconds=row.get("edit_start_seconds", 0.0),
+                    edit_end_seconds=row.get("edit_end_seconds"),
+                    edit_segments=json.loads(row.get("edit_segments_json") or "[]"),
                     num_inference_steps=row.get("num_inference_steps", 50),
                     num_frames=row.get("num_frames", 81),
                     height=row.get("height", 480),
@@ -474,6 +496,7 @@ class JobRunner:
             self._db.update_job(
                 job.id, {
                     "status": job.status.value,
+                    "queued_at": job.queued_at,
                     "started_at": job.started_at,
                     "finished_at": job.finished_at,
                     "error": job.error,
@@ -491,43 +514,52 @@ class JobRunner:
             generator.shutdown()
 
     def _shutdown(self) -> None:
-        """Stop accepting work and release workers before their log manager."""
-        with self._jobs_lock:
+        with self._condition:
             if self._closed:
                 return
             self._closed = True
-            for job in self._jobs.values():
+            jobs = list(self._jobs.values())
+            for job in jobs:
                 if job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
                     job._stop_event.set()
-            self._queue.put(None)
-        for job in list(self._jobs.values()):
+                if job.status == JobStatus.QUEUED:
+                    job.status = JobStatus.STOPPED
+                    job.queued_at = None
+                    job.finished_at = time.time()
+                    job._log_buf.phase = "stopped"
+                    self._save_job(job)
+            self._condition.notify_all()
+        for job in jobs:
             self._terminate_training_process(job)
-        # Inference cancellation is cooperative. Keep its queues and owning
-        # thread alive until loading/generation and worker cleanup finish.
         self._worker.join()
         self._clear_generators()
         self._mp_manager.shutdown()
         atexit.unregister(self._shutdown)
 
     def _serve_jobs(self) -> None:
-        # The owning thread stays alive across jobs: worker parent-death signals
-        # must not fire when a per-job thread exits.
         while True:
-            item = self._queue.get()
-            if item is None:
-                self._clear_generators()
-                return
-            job, stop_event = item
-            with self._jobs_lock:
-                if stop_event.is_set():
-                    if job._stop_event is stop_event:
-                        job.status = JobStatus.STOPPED
-                        job.finished_at = time.time()
-                        job._log_buf.phase = "stopped"
-                        self._save_job(job)
-                    continue
-                self._active_job = job
-                job.status = JobStatus.RUNNING
+            with self._condition:
+                job = None
+                while not self._closed:
+                    plan = plan_dispatch(self._jobs, 1)
+                    for job_id, reason in plan.fail.items():
+                        failed = self._jobs[job_id]
+                        failed.status = JobStatus.FAILED
+                        failed.error = reason
+                        failed.queued_at = None
+                        failed.finished_at = time.time()
+                        failed._log_buf.phase = "failed"
+                        self._save_job(failed)
+                    if plan.start:
+                        job = self._jobs[plan.start[0]]
+                        self._active_job = job
+                        job.status = JobStatus.RUNNING
+                        job.queued_at = None
+                        break
+                    self._condition.wait()
+                if self._closed:
+                    break
+            assert job is not None
             try:
                 if job.job_type != "inference":
                     self._clear_generators()
@@ -540,8 +572,10 @@ class JobRunner:
                 job._log_buf.phase = "failed"
                 self._save_job(job)
             finally:
-                with self._jobs_lock:
+                with self._condition:
                     self._active_job = None
+                    self._condition.notify_all()
+        self._clear_generators()
 
     def create_job(
         self,
@@ -688,6 +722,8 @@ class JobRunner:
             self._db.delete_job(job_id)
         except Exception as exc:
             logger.warning("Failed to delete job %s from database: %s", job_id, exc)
+        with self._condition:
+            self._condition.notify_all()
         logger.info("Deleted job %s", job.id)
         return True
 
@@ -748,6 +784,8 @@ class JobRunner:
         if source is None:
             raise ValueError(f"Job {job_id} not found")
         config = {f: copy.deepcopy(getattr(source, f)) for f in self.CONFIG_FIELDS}
+        if source.original_num_frames is not None:
+            config["num_frames"] = source.original_num_frames
         return self.create_job(job_id=new_job_id, **config)
 
     #: Editable exactly when startable: the same set start_job() accepts.
@@ -778,36 +816,92 @@ class JobRunner:
             validated = CreateJobRequest(**{**merged, **updates}).model_dump()
             updates = {key: validated[key] for key in updates}
             self._db.update_job_config(job_id, updates)
+            if "num_frames" in updates:
+                job.original_num_frames = None
             for field_name, value in updates.items():
                 setattr(job, field_name, value)
             self._save_job(job)
             return job
 
     def start_job(self, job_id: str) -> Job:
-        """Enqueue a job once; one persistent thread owns its full lifecycle."""
-        with self._jobs_lock:
+        return self.enqueue_jobs([job_id])[0]
+
+    def enqueue_job(self, job_id: str) -> Job:
+        return self.enqueue_jobs([job_id])[0]
+
+    def enqueue_jobs(self, job_ids: list[str]) -> list[Job]:
+        with self._condition:
             if self._closed:
                 raise ValueError("Job runner is shutting down")
+            if not job_ids or len(set(job_ids)) != len(job_ids):
+                raise ValueError("Provide a nonempty list of distinct jobs")
+            editing_dependents = set(self._editing_media)
+            for source in self._editing_media:
+                editing_dependents.update(self._descendants(source))
+            if editing_dependents.intersection(job_ids):
+                raise ValueError("Wait for source video editing to finish before queuing this job")
+            jobs = []
+            for job_id in job_ids:
+                job = self._jobs.get(job_id)
+                if job is None:
+                    raise ValueError(f"Job {job_id} not found")
+                if job.status not in (JobStatus.PENDING, JobStatus.FAILED,
+                                      JobStatus.STOPPED) or self._active_job is job:
+                    raise ValueError(f"Job cannot start while {job.status.value}")
+                if (job.model_id.rstrip("/").split("/")[-1].lower() == "fastvideo-fasth3-8-step-v2"
+                        and (job.references or job.image_path or job.last_image_path)):
+                    raise ValueError("FastH3 V2 is T2AV-only and does not support image/video references. "
+                                     "Remove references to generate independent shots, or select a Ref2VA checkpoint.")
+                loop = circular_dependency(self._jobs, job_id)
+                if loop:
+                    raise ValueError("Circular dependency loop: " + " -> ".join(loop))
+                for source in dependencies(job.references):
+                    if source not in self._jobs:
+                        raise ValueError(f"Referenced job {source} not found")
+                jobs.append(job)
+            submissions = []
+            queued_at = self._last_queued_at
+            for job in jobs:
+                queued_at = max(time.time(), queued_at + 0.000001)
+                submissions.append((job.id, queued_at))
+            self._db.queue_jobs(submissions)
+            self._last_queued_at = queued_at
+            for job, (_, timestamp) in zip(jobs, submissions, strict=True):
+                if job.original_num_frames is not None:
+                    job.num_frames = job.original_num_frames
+                job.original_num_frames = None
+                job.edit_start_seconds = 0.0
+                job.edit_end_seconds = None
+                job.edit_segments = []
+                job.status = JobStatus.QUEUED
+                job.error = None
+                job.output_path = None
+                job.log_file_path = None
+                job.started_at = None
+                job.finished_at = None
+                job.queued_at = timestamp
+                job._stop_event = threading.Event()
+                job._log_buf = JobLogBuffer()
+                job._log_buf.phase = "queued"
+                job.log_file_handler = None
+                job._process = None
+            self._condition.notify_all()
+            return jobs
+
+    def dequeue_job(self, job_id: str) -> Job:
+        with self._condition:
             job = self._jobs.get(job_id)
             if job is None:
                 raise ValueError(f"Job {job_id} not found")
-            if job.status in (JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.COMPLETED) or self._active_job is job:
-                raise ValueError(f"Job cannot start while {job.status.value}")
-            job.status = JobStatus.QUEUED
-            job.error = None
-            job.output_path = None
-            job.log_file_path = None
-            job.started_at = None
-            job.finished_at = None
-            # A new event keeps an old cancelled queue entry from executing a restart.
-            job._stop_event = threading.Event()
-            job._log_buf = JobLogBuffer()
-            job._log_buf.phase = "queued"
-            job.log_file_handler = None
-            job._process = None
+            if job.status != JobStatus.QUEUED:
+                raise ValueError("Job is not queued")
+            job._stop_event.set()
+            job.status = JobStatus.PENDING
+            job.queued_at = None
+            job._log_buf.phase = "pending"
             self._save_job(job)
-            self._queue.put((job, job._stop_event))
-        return job
+            self._condition.notify_all()
+            return job
 
     def stop_job(self, job_id: str) -> Job:
         """Cancel queued work immediately; running work stops between phases."""
@@ -820,9 +914,12 @@ class JobRunner:
             job._stop_event.set()
             if job.status == JobStatus.QUEUED:
                 job.status = JobStatus.STOPPED
+                job.queued_at = None
                 job.finished_at = time.time()
                 job._log_buf.phase = "stopped"
                 self._save_job(job)
+        with self._condition:
+            self._condition.notify_all()
         self._terminate_training_process(job)
         return job
 
@@ -846,6 +943,84 @@ class JobRunner:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
         process.wait()
+
+    def _descendants(self, source_id: str) -> set[str]:
+        """Caller holds the jobs lock while traversing the dependency graph."""
+        found = {source_id}
+        while True:
+            children = {
+                job.id
+                for job in self._jobs.values()
+                if job.id not in found and set(dependencies(job.references)).intersection(found)
+            }
+            if not children:
+                return found - {source_id}
+            found.update(children)
+
+    def _media_job(self, job_id: str) -> Job:
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise ValueError(f"Job {job_id} not found")
+            if any(self._jobs[key].status in (JobStatus.QUEUED, JobStatus.RUNNING)
+                   for key in self._descendants(job_id)):
+                raise ValueError("Stop dependent jobs before editing their source video")
+            return job
+
+    @contextlib.contextmanager
+    def _editing_video(self, job_id: str):
+        with media_lock(job_id):
+            with self._condition:
+                job = self._media_job(job_id)
+                self._editing_media.add(job_id)
+            try:
+                yield job
+            finally:
+                with self._condition:
+                    self._editing_media.discard(job_id)
+                    self._condition.notify_all()
+
+    def _set_output(self,
+                    job: Job,
+                    path: str,
+                    frames: int,
+                    start: float = 0.0,
+                    end: float | None = None,
+                    segments: list[dict[str, Any]] | None = None) -> None:
+        with self._condition:
+            invalidated = [
+                self._jobs[key] for key in self._descendants(job.id) if self._jobs[key].status == JobStatus.COMPLETED
+            ]
+            self._db.update_job_media(job.id, path, frames, start, end, segments or [],
+                                      [child.id for child in invalidated])
+            if job.original_num_frames is None:
+                job.original_num_frames = job.num_frames
+            job.output_path = path
+            job.num_frames = frames
+            job.edit_start_seconds = start
+            job.edit_end_seconds = end
+            job.edit_segments = segments or []
+            for child in invalidated:
+                child.status = JobStatus.FAILED
+                child.error = "A reference clip changed; regenerate this clip to use its new ending."
+                child._log_buf.phase = "failed"
+            self._condition.notify_all()
+
+    def trim_job(self,
+                 job_id: str,
+                 start_seconds: float = 0.0,
+                 end_seconds: float | None = None,
+                 segments: list[dict[str, Any]] | None = None) -> Job:
+        with self._editing_video(job_id) as job:
+            path, frames = trim_video(job, start_seconds, end_seconds, segments)
+            self._set_output(job, path, frames, start_seconds, end_seconds, segments)
+            return job
+
+    def restore_job_video(self, job_id: str) -> Job:
+        with self._editing_video(job_id) as job:
+            path, frames = restore_original(job)
+            self._set_output(job, path, frames)
+            return job
 
     def get_job_logs(self, job_id: str, after: int = 0) -> dict[str, Any]:
         """Return log lines for a job.
@@ -1155,7 +1330,7 @@ class JobRunner:
         queue_listener.start()
 
         # Set output directory, create if it doesn't exist
-        job_output_dir = os.path.join(self.output_dir, job.id)
+        job_output_dir = os.path.join(self.output_dir, job.id, "attempt-" + uuid.uuid4().hex)
         os.makedirs(job_output_dir, exist_ok=True)
 
         try:
@@ -1175,6 +1350,12 @@ class JobRunner:
                 logger.warning("Job stopped before execution started")
                 return
 
+            resolved_references = resolve_references(
+                job.references,
+                self.get_job,
+                last_frame=lambda source: last_frame_for_job(source, self.upload_dir),
+                last_clip=lambda source: last_clip_for_job(source, self.upload_dir),
+            )
             buf.phase = "loading model"
             logger.info("Loading model...")
 
@@ -1240,7 +1421,7 @@ class JobRunner:
             if job.image_path:
                 gen_kwargs["image_path"] = job.image_path
             if job.references:
-                gen_kwargs["references"] = _build_h3_references(job.references)
+                gen_kwargs["references"] = _build_h3_references(resolved_references)
             if job.last_image_path:
                 # _prepare_fl2va requires a PIL image, not a path.
                 from PIL import Image as _PILImage

@@ -32,7 +32,7 @@ describe('CreateJobButton', () => {
     await user.click(screen.getByRole('menuitem', { name: /I2V/i }));
 
     expect(
-      screen.getByRole('dialog', { name: 'New Inference Job (I2V)' }),
+      await screen.findByRole('dialog', { name: 'New Inference Job (I2V)' }),
     ).toBeInTheDocument();
   });
 
@@ -49,7 +49,7 @@ describe('CreateJobButton', () => {
     await user.keyboard('{Enter}');
 
     expect(
-      screen.getByRole('dialog', { name: 'New Inference Job (T2V)' }),
+      await screen.findByRole('dialog', { name: 'New Inference Job (T2V)' }),
     ).toBeInTheDocument();
     await user.keyboard('{Escape}');
     await waitFor(() =>
@@ -72,7 +72,7 @@ describe('CreateJobButton', () => {
       for (let attempt = 0; attempt < 2; attempt++) {
         await user.click(trigger);
         await user.click(screen.getAllByRole('menuitem')[0]);
-        const dialog = screen.getByRole('dialog');
+        const dialog = await screen.findByRole('dialog');
         await user.click(
           within(dialog).getByRole('button', { name: 'Close' }),
         );

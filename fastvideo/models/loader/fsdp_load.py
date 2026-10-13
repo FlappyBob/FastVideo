@@ -404,12 +404,13 @@ def maybe_load_fsdp_model(
     # devices. Discrete FSDP inference must stage the full source tensors on CPU
     # while each rank materializes its shard, or the full checkpoint and shards
     # peak together on the accelerator. Training keeps GPU-direct loading.
-    # A packed NVFP4 export is always staged on CPU.
+    # Explicit CPU targets (e.g. H3 layerwise offload) and packed NVFP4
+    # exports must not stage the full source checkpoint on the GPU.
     load_weights_to_cpu = _should_stage_transformer_weights_on_cpu(
         cpu_offload=cpu_offload,
         fsdp_inference=fsdp_inference,
         has_unified_memory=has_unified_memory,
-    ) or packed_nvfp4_export is not None
+    ) or device.type == "cpu" or packed_nvfp4_export is not None
     weight_iterator = safetensors_weights_iterator(weight_dir_list, to_cpu=load_weights_to_cpu)
     logger.info("Loading transformer weights with to_cpu=%s", load_weights_to_cpu)
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)

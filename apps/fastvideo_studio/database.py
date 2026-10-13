@@ -113,6 +113,11 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "jobs", "generator_update_interval", "INTEGER", "5")
     _add_column_if_missing(conn, "jobs", "real_score_model_path", "TEXT", "''")
     _add_column_if_missing(conn, "jobs", "fake_score_model_path", "TEXT", "''")
+    _add_column_if_missing(conn, "jobs", "queued_at", "REAL", "NULL")
+    _add_column_if_missing(conn, "jobs", "original_num_frames", "INTEGER", "NULL")
+    _add_column_if_missing(conn, "jobs", "edit_start_seconds", "REAL", "0.0")
+    _add_column_if_missing(conn, "jobs", "edit_end_seconds", "REAL", "NULL")
+    _add_column_if_missing(conn, "jobs", "edit_segments_json", "TEXT", "'[]'")
     # Settings table
     _add_column_if_missing(conn, "settings", "vae_cpu_offload", "INTEGER", "0")
     _add_column_if_missing(conn, "settings", "image_encoder_cpu_offload", "INTEGER", "0")
@@ -333,6 +338,7 @@ class Database:
             return
         allowed = {
             "status",
+            "queued_at",
             "started_at",
             "finished_at",
             "error",
@@ -352,9 +358,26 @@ class Database:
         self._execute(sql, tuple(vals))
         self._commit()
 
+    def queue_jobs(self, submissions: list[tuple[str, float]]) -> None:
+        """Persist a whole queue submission before the scheduler can observe it."""
+        with self._conn() as conn:
+            for job_id, queued_at in submissions:
+                cursor = conn.execute(
+                    "UPDATE jobs SET status='queued', queued_at=?, error=NULL, output_path=NULL, "
+                    "log_file_path=NULL, started_at=NULL, finished_at=NULL, edit_start_seconds=0, "
+                    "edit_end_seconds=NULL, edit_segments_json='[]', "
+                    "num_frames=COALESCE(original_num_frames,num_frames), original_num_frames=NULL WHERE id=?",
+                    (queued_at, job_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError(f"Job {job_id} not found")
+
     def update_job_config(self, job_id: str, updates: dict[str, Any]) -> None:
         """Persist validated configuration, without allowing runtime state edits."""
-        protected = {"id", "status", "created_at", "started_at", "finished_at", "error", "output_path", "log_file_path"}
+        protected = {
+            "id", "status", "created_at", "started_at", "finished_at", "error", "output_path", "log_file_path",
+            "queued_at", "edit_start_seconds", "edit_end_seconds", "edit_segments_json", "original_num_frames"
+        }
         allowed = _get_table_columns(self._conn(), "jobs") - protected
         values = {
             ("references_json" if key == "references" else key): (json.dumps(value) if key == "references" else value)
@@ -362,10 +385,33 @@ class Database:
         }
         if not values.keys() <= allowed:
             raise ValueError("Unknown or non-configurable job fields")
+        if "num_frames" in values:
+            values["original_num_frames"] = None
         if values:
             assignments = ", ".join(f"{key} = ?" for key in values)
             self._execute(f"UPDATE jobs SET {assignments} WHERE id = ?", (*values.values(), job_id))
             self._commit()
+
+    def update_job_media(self,
+                         job_id: str,
+                         path: str,
+                         frames: int,
+                         start: float,
+                         end: float | None,
+                         segments: list[dict[str, Any]],
+                         invalidated_ids: list[str] | None = None) -> None:
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "UPDATE jobs SET original_num_frames=COALESCE(original_num_frames,num_frames), "
+                "output_path=?, num_frames=?, edit_start_seconds=?, edit_end_seconds=?, "
+                "edit_segments_json=? WHERE id=?",
+                (path, frames, start, end, json.dumps(segments), job_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Job {job_id} not found")
+            for dependent_id in invalidated_ids or []:
+                conn.execute("UPDATE jobs SET status='failed', error=? WHERE id=?",
+                             ("A reference clip changed; regenerate this clip to use its new ending.", dependent_id))
 
     def delete_job(self, job_id: str) -> bool:
         """Delete a job. Returns True if a row was deleted."""
@@ -585,6 +631,11 @@ def _row_to_job(row: sqlite3.Row) -> dict[str, Any]:
         "job_type": _sqlite_row_get(row, "job_type", "inference"),
         "status": row["status"],
         "created_at": row["created_at"],
+        "queued_at": _sqlite_row_get(row, "queued_at", None),
+        "original_num_frames": _sqlite_row_get(row, "original_num_frames", None),
+        "edit_start_seconds": _sqlite_row_get(row, "edit_start_seconds", 0.0),
+        "edit_end_seconds": _sqlite_row_get(row, "edit_end_seconds", None),
+        "edit_segments_json": _sqlite_row_get(row, "edit_segments_json", "[]"),
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
         "error": row["error"],
