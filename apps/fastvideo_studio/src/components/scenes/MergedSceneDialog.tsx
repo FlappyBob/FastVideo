@@ -40,7 +40,8 @@ export function MergedSceneDialog({ merged, onClose }: MergedSceneDialogProps) {
 
   return (
     <Dialog open={!!merged} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-3xl">
+      {/* Avoid background filter compositing while playing a long scene. */}
+      <DialogContent className="max-w-3xl" blurBackdrop={false}>
         <DialogHeader>
           <DialogTitle>{merged?.title} merged</DialogTitle>
           <DialogDescription>
