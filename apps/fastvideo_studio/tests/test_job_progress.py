@@ -48,3 +48,24 @@ def test_log_cursor_advances_past_ring_capacity():
     assert buffer.get_lines(cursor) == (['d', 'e'], 5)
     assert buffer.get_lines(0) == (['c', 'd', 'e'], 5)
     assert buffer.get_lines(5) == ([], 5)
+
+
+def test_persisted_terminal_state_wins_over_replayed_log_phase(tmp_path):
+    from fastvideo_studio.database import Database
+    from fastvideo_studio.job_runner import JobRunner, JobStatus
+    runner = JobRunner(str(tmp_path/'videos'), str(tmp_path/'logs'), Database(tmp_path/'jobs.db'))
+    try:
+        for state in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.STOPPED, JobStatus.PENDING):
+            job = runner.create_job(state.value, 'model', 'prompt')
+            log = tmp_path/f'{state.value}.log'
+            log.write_text('Saved video to output.mp4\n')
+            job.log_file_path = str(log)
+            job.status = state
+            runner._save_job(job)
+        runner._load_jobs()
+        assert runner.get_job('completed').to_dict()['phase'] == 'done'
+        assert runner.get_job('completed').to_dict()['progress'] == 100
+        for state in ('failed', 'stopped', 'pending'):
+            assert runner.get_job(state).to_dict()['phase'] == state
+    finally:
+        runner._shutdown()

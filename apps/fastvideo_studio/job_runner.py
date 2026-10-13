@@ -503,6 +503,12 @@ class JobRunner:
                     sp_size=row.get("sp_size", -1),
                 )
                 self._load_logs(job)
+                # Replayed output can end with an old stage message. The durable
+                # lifecycle state is authoritative after a server restart.
+                job._log_buf.phase = "done" if job.status == JobStatus.COMPLETED else job.status.value
+                if job.status == JobStatus.COMPLETED:
+                    job._log_buf.progress = 100.0
+                    job._log_buf.progress_msg = ""
                 with self._jobs_lock:
                     self._jobs[job.id] = job
             if self._jobs:
