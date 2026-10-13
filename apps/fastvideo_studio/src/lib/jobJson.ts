@@ -70,6 +70,14 @@ export function parseJobJson(text: string): JobJsonResult {
 		return { ok: false, error: "prompt must be text or a list of text lines." };
 	}
 
+	if (data.attention_backend !== undefined && data.attention_backend !== null && typeof data.attention_backend !== "string") {
+		return { ok: false, error: "attention_backend must be text or null (Auto)." };
+	}
+	if (data.vsa_tile_size !== undefined && data.vsa_tile_size !== null &&
+		(typeof data.vsa_tile_size !== "number" || !Number.isInteger(data.vsa_tile_size) || data.vsa_tile_size <= 0)) {
+		return { ok: false, error: "vsa_tile_size must be a positive integer or null (Auto)." };
+	}
+
 	const references: { source: string; media_type: string }[] = [];
 	if (data.references !== undefined && data.references !== null) {
 		if (!Array.isArray(data.references)) return { ok: false, error: "references must be a list." };
@@ -88,6 +96,8 @@ export function parseJobJson(text: string): JobJsonResult {
 
 	const job: JobLike = { id: `imported-${Date.now()}`, model_id: data.model_id.trim(), prompt, references };
 	const target = job as unknown as Record<string, unknown>;
+	if (data.attention_backend !== undefined) target.attention_backend = data.attention_backend;
+	if (data.vsa_tile_size !== undefined) target.vsa_tile_size = data.vsa_tile_size;
 	for (const key of STRING_KEYS) if (typeof data[key] === "string") target[key] = data[key];
 	for (const key of NUMBER_KEYS) if (typeof data[key] === "number" && Number.isFinite(data[key])) target[key] = data[key];
 	for (const key of BOOLEAN_KEYS) if (typeof data[key] === "boolean") target[key] = data[key];

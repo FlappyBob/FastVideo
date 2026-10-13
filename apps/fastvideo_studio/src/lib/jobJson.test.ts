@@ -76,3 +76,15 @@ describe("parseJobJson", () => {
 		expect(parseJobJson(text)).toEqual({ ok: false, error });
 	});
 });
+
+it('preserves explicit and automatic attention settings when importing a take', () => {
+  expect(ok(JSON.stringify({model_id:'m',prompt:'p',attention_backend:'VIDEO_SPARSE_ATTN_H3',vsa_tile_size:64})).job)
+    .toMatchObject({attention_backend:'VIDEO_SPARSE_ATTN_H3',vsa_tile_size:64});
+  expect(ok(JSON.stringify({model_id:'m',prompt:'p',attention_backend:null,vsa_tile_size:null})).job)
+    .toMatchObject({attention_backend:null,vsa_tile_size:null});
+});
+
+it.each([0, -64, 1.5, '64'])('rejects invalid imported attention tile %s', (tile) => {
+  const result = parseJobJson(JSON.stringify({model_id:'m',prompt:'p',vsa_tile_size:tile}));
+  expect(result.ok).toBe(false);
+});

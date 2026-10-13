@@ -69,6 +69,7 @@ class JobLogBuffer:
     def __init__(self, maxlen: int = _MAX_LOG_LINES):
         self._lines: collections.deque[str] = collections.deque(maxlen=maxlen)
         self._lock = threading.Lock()
+        self._total_lines = 0
         self.progress: float = 0.0  # 0 – 100
         self.progress_msg: str = ""  # e.g. "20/50 steps"
         self.phase: str = "initializing"  # human-readable phase
@@ -81,38 +82,57 @@ class JobLogBuffer:
                 continue
             with self._lock:
                 self._lines.append(stripped)
+                self._total_lines += 1
             self._parse_progress(stripped)
 
     def get_lines(self, after: int = 0) -> tuple[list[str], int]:
-        """Return ``(lines[after:], total_len)``."""
+        """Return retained lines after an absolute cursor, plus the next cursor."""
         with self._lock:
             all_lines = list(self._lines)
-        return all_lines[after:], len(all_lines)
+            total = self._total_lines
+        start = max(0, after - (total - len(all_lines)))
+        return all_lines[start:], total
 
     # -- internal helpers ---------------------------------------------------
 
     def _parse_progress(self, line: str):
-        """Try to extract a percentage / fraction from a tqdm line."""
-        m = _TQDM_PCT_RE.search(line)
-        if m:
-            self.progress = min(float(m.group(1)), 100.0)
-        m2 = _TQDM_FRAC_RE.search(line)
-        if m2:
-            cur, total = int(m2.group(1)), int(m2.group(2))
-            if total > 0:
-                self.progress = min(cur / total * 100.0, 100.0)
-                self.progress_msg = f"{cur}/{total} steps"
-        # Detect high-level phases from FastVideo log messages
+        """Read explicit progress signals, never fractions in paths or schedules."""
         low = line.lower()
-        if "loading model" in low or "loading" in low and "checkpoint" in low:
+        stages = {
+            "input_preparation_stage": "preparing inputs",
+            "conditioning_stage": "encoding prompt",
+            "latent_preparation_stage": "preparing latents",
+            "denoising_stage": "denoising",
+            "video_decoding_stage": "video decoding",
+            "audio_decoding_stage": "audio decoding",
+        }
+        if "starting execution" in low:
+            for stage, phase in stages.items():
+                if f"[{stage}|" in low:
+                    self.phase = phase
+                    self.progress = 0.0
+                    self.progress_msg = ""
+                    return
+        percent = _TQDM_PCT_RE.search(line)
+        training_step = re.search(r"\btraining\s+steps?\s+\d+/\d+", low)
+        if percent or training_step:
+            if percent:
+                self.progress = min(float(percent.group(1)), 100.0)
+            fraction = _TQDM_FRAC_RE.search(line[percent.start():] if percent else line)
+            if fraction:
+                current, total = int(fraction.group(1)), int(fraction.group(2))
+                if total > 0:
+                    self.progress = min(current / total * 100.0, 100.0)
+                    self.progress_msg = f"{current}/{total} steps"
+        if "loading model" in low or ("loading" in low and "checkpoint" in low):
             self.phase = "loading model"
-        elif "denoising" in low or "timestep" in low:
+        elif "denoising" in low and (percent or "starting execution" in low):
             self.phase = "denoising"
-        elif "saving" in low or "saved" in low or "checkpoint" in low:
+        elif "saving video" in low or "saved video" in low:
             self.phase = "saving"
-        elif "encoding" in low or "vae" in low:
+        elif "vae encoding" in low:
             self.phase = "VAE encoding"
-        elif "training" in low or "step" in low or "loss" in low:
+        elif training_step or re.search(r"\btraining\b", low):
             self.phase = "training"
 
 
