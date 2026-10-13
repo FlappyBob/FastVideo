@@ -1463,3 +1463,23 @@ it('explains FastH3 V2 continuation restrictions while allowing independent scen
   await waitFor(() => expect(queueJobs).toHaveBeenCalledWith(['wolf-1', 'wolf-2']));
   expect(updateJob).not.toHaveBeenCalled();
 });
+
+it('refreshes saved takes along with running jobs', async () => {
+  const interval = vi.spyOn(globalThis, 'setInterval');
+  const first = wolf(1, {id:'external-first',status:'running',prompt:'[Shot 1] Original take.'});
+  const second = wolf(1, {id:'external-second',status:'pending',prompt:'[Shot 1] Newly planned take.'});
+  vi.mocked(getJobsList).mockResolvedValue([first]);
+  const saved: StoredScene = {id:'external-scene',name:'External production',clips:[
+    {id:'external-clip',name:'Opening',job_ids:[first.id],selected_job_id:first.id},
+  ]};
+  vi.mocked(getScenes).mockResolvedValue([saved]);
+  render(<ScenesPage />);
+  await screen.findByText('Original take.');
+  const poll=interval.mock.calls.find(([,ms])=>ms===3000)?.[0] as ()=>void;
+  vi.mocked(getJobsList).mockResolvedValue([first,second]);
+  vi.mocked(getScenes).mockResolvedValue([{...saved,clips:[{...saved.clips[0],job_ids:[first.id,second.id],selected_job_id:second.id}]}]);
+  await act(async()=>poll());
+  await waitFor(()=>expect(screen.getByLabelText('Take for clip 1')).toHaveValue(second.id));
+  expect(screen.getByText('Newly planned take.')).toBeInTheDocument();
+  interval.mockRestore();
+});

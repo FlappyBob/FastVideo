@@ -74,12 +74,21 @@ export default function ScenesPage() {
   const hasActive = jobs.some((j) => j.status === 'queued' || j.status === 'running');
   React.useEffect(() => {
     if (!hasActive) return;
+    let cancelled = false;
+    let refreshing = false;
     const interval = setInterval(() => {
-      getJobsList('inference')
-        .then(setJobs)
-        .catch(() => {});
+      if (refreshing) return;
+      refreshing = true;
+      Promise.all([getJobsList('inference'), getScenes()])
+        .then(([list, stored]) => {
+          if (cancelled) return;
+          setJobs(list);
+          setRecords(stored);
+        })
+        .catch(() => {})
+        .finally(() => { refreshing = false; });
     }, POLL_MS);
-    return () => clearInterval(interval);
+    return () => { cancelled = true; clearInterval(interval); };
   }, [hasActive]);
 
   // Attach the previous clip's last frame to `clip` and rewrite its prompt to open on
