@@ -320,6 +320,37 @@ opening the UI. Planner/image errors remain errors; there is no synthetic
 fallback in the real server. Image requests are not automatically retried after
 uncertain transport failures.
 
+### Using an existing Codex login for planning
+
+The optional Codex CLI provider uses the server user's existing `codex login`.
+It needs no separately configured HTTP planner or API key. Check
+`codex login status`, then pass a private JSON file containing:
+
+```json
+{"provider": "codex", "timeout_seconds": 240}
+```
+
+An optional `model` selects a model available to that account; otherwise the
+CLI default applies. Each request starts an independent, ephemeral structured
+planning turn with the current story and up to nine explicit reference images.
+It does not reuse this chat's hidden context or guarantee the same model as a
+particular chat. Normal account limits still apply. The adapter ignores user
+CLI configuration, uses a temporary directory and read-only sandbox, disables
+shell/agent/browser/app tools, and does not automatically retry failures.
+This provides planning, not an image-generation service. Upload images or
+configure the separate `image` block when needed.
+
+### Waiting for an idle GPU for a local verification run
+
+`python -m fastvideo_studio.gpu_wait --record /path/to/wait-status.json -- <command>`
+waits for three consecutive samples with no compute process, less than 1 GiB
+used memory, low utilization, and at least 45000 MiB free. It then supplies
+`CUDA_VISIBLE_DEVICES` to the command. Options include `--count`, `--timeout`
+and `--min-free-mib`. Launch it through your site's process manager with an
+overall deadline that also covers generation. It does not stop existing jobs.
+This observes availability; it is not a cluster reservation and cannot prevent
+an unrelated scheduler from allocating the device immediately afterwards.
+
 For a remote machine, use the same-origin proxy and forward only the web port:
 
 ```bash

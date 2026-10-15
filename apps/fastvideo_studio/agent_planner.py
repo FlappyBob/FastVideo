@@ -84,6 +84,11 @@ def load_planner(path: str):
     if not path:
         return None
     settings = json.loads(Path(path).read_text())
+    if settings.get('provider') == 'codex':
+        from .codex_planner import CodexPlanner
+        return CodexPlanner(settings)
+    if settings.get('provider', 'openai-compatible') != 'openai-compatible':
+        raise ValueError('Unknown planner provider')
     return StoryPlanner(settings)
 
 
