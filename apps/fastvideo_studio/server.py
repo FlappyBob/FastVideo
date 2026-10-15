@@ -37,6 +37,10 @@ from fastvideo_studio.gpu import get_gpu_snapshot
 from fastvideo_studio.frames import FrameError, last_clip_for_job, last_frame_for_job
 from fastvideo_studio.merge import MergeError, merge_jobs, merged_path
 from fastvideo_studio.scene_routes import build_scene_router
+from fastvideo_studio.agent_project import AgentProjectStore
+from fastvideo_studio.agent_service import AgentService
+from fastvideo_studio.agent_routes import build_agent_router
+from fastvideo_studio.agent_planner import load_planner, load_image_generator
 from fastvideo_studio.job_runner import JobRunner, JobStatus
 from fastvideo_studio.inference_options import inference_options
 from fastvideo.attention.selector import coerce_attn_backend
@@ -61,6 +65,9 @@ database: Database | None = None
 upload_dir: str = ""
 datasets_upload_dir: str = ""
 verbose = 0
+_story_planner = None
+_reference_generator = None
+_agent_service = None
 
 app = FastAPI(
     title="FastVideo Job Runner API",
@@ -870,7 +877,7 @@ def create_local_env(host: str, port: int) -> None:
 
 
 def main() -> None:
-    global job_runner, database, upload_dir, verbose, datasets_upload_dir  # noqa: PLW0603
+    global job_runner, database, upload_dir, verbose, datasets_upload_dir, _story_planner, _reference_generator  # noqa: PLW0603
 
     # Set up signal handlers to prevent worker crashes from killing the server
     _setup_signal_handlers()
@@ -879,6 +886,9 @@ def main() -> None:
     default_data_dir = Path(os.path.dirname(__file__), "..", "outputs", "ui_data")
 
     parser = argparse.ArgumentParser(description="FastVideo Job Runner API server")
+    parser.add_argument("--agent-config",
+                        default="",
+                        help="Private JSON planner configuration; never returned to clients")
     parser.add_argument(
         "--host",
         default="0.0.0.0",
@@ -925,6 +935,8 @@ def main() -> None:
 
     db_path = _get_db_path(data_dir)
     database = Database(db_path)
+    _story_planner = load_planner(args.agent_config)
+    _reference_generator = load_image_generator(args.agent_config)
     verbose = args.verbose
     logger.info("Database: %s", db_path)
 
@@ -949,6 +961,40 @@ def main() -> None:
     finally:
         job_runner._shutdown()
 
+
+def _get_agent_service():
+    global _agent_service  # noqa: PLW0603
+    if database is None:
+        raise HTTPException(503, "Database not initialized")
+    if _agent_service is None or _agent_service.store.path != Path(database._path):
+
+        def create_agent_job(job_id, payload):
+            request = CreateJobRequest.model_validate(payload)
+            coerce_attn_backend(request.attention_backend)
+            job = job_runner.get_job(job_id)
+            if job is None:
+                job = job_runner.create_job(job_id=job_id, **request.model_dump())
+            # JobRunner's legacy create path logs persistence errors. Agent
+            # admission must verify persistence before anything is enqueued.
+            if database.get_job(job_id) is None:
+                database.insert_job(job.to_dict())
+            return job.to_dict()
+
+        def get_agent_job(job_id):
+            job = job_runner.get_job(job_id)
+            return job.to_dict() if job else None
+
+        _agent_service = AgentService(AgentProjectStore(database._path),
+                                      create_agent_job,
+                                      get_agent_job,
+                                      job_runner.enqueue_jobs,
+                                      lambda: [m["id"] for m in _available_models],
+                                      planner=_story_planner,
+                                      image_generator=_reference_generator)
+    return _agent_service
+
+
+app.include_router(build_agent_router(_get_agent_service, lambda: Path(upload_dir) / "agent-assets"))
 
 app.include_router(
     build_scene_router(lambda: database, lambda: [j.to_dict() for j in job_runner.list_jobs("inference")]))

@@ -14,6 +14,7 @@ const TAB_TITLES: Record<string, string> = {
   '/datasets': 'Datasets',
   '/gallery': 'Gallery',
   '/scenes': 'Scenes',
+  '/agent': 'Video Agent',
   '/gpus': 'GPUs',
   '/settings': 'Settings',
 };

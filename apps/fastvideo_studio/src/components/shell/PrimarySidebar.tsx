@@ -151,6 +151,14 @@ export default function PrimarySidebar({
             Datasets
           </Link>
           <Link
+            href="/agent"
+            aria-current={pathname === '/agent' ? 'page' : undefined}
+            onClick={onMobileClose}
+            className={cn(TAB_BASE, pathname === '/agent' && TAB_ACTIVE)}
+          >
+            Video Agent
+          </Link>
+          <Link
             href="/scenes"
             aria-current={pathname === '/scenes' ? 'page' : undefined}
             onClick={onMobileClose}

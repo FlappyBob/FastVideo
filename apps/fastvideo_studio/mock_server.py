@@ -47,13 +47,15 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 
+from fastvideo_studio.agent_project import AgentProjectStore, V2 as _AGENT_V2
+from fastvideo_studio.agent_service import AgentService
+from fastvideo_studio.agent_routes import build_agent_router
 from fastvideo_studio.database import Database, default_settings_dict
 from fastvideo_studio.job_queue import circular_dependency, dependencies, plan_dispatch
 from fastvideo_studio.merge import MergeError, merge_jobs, merged_path
 from fastvideo_studio.trim import BRIGHTNESS_RANGE, CONTRAST_RANGE, SATURATION_RANGE
 from fastvideo_studio.scene_routes import build_scene_router
-from fastvideo_studio.inference_options import inference_options
-from fastvideo.attention.selector import coerce_attn_backend
+from fastvideo_studio.mock_attention import coerce_attn_backend, inference_options
 
 from fastvideo_studio.models import (CreateDatasetRequest, CreateJobRequest, GradeSegment, MergeSceneRequest,
                                      QueueJobsRequest, SettingsUpdate, TrimRequest, UpdateCaptionRequest, model_label)
@@ -1233,6 +1235,35 @@ app.include_router(build_scene_router(lambda: _scene_db, lambda: list(_jobs.valu
 def get_inference_options(model_id: str = ""):
     return inference_options(model_id)
 
+
+# Agent workspace uses the same contract with explicitly simulated generation.
+
+
+def _create_agent_mock_job(job_id, payload):
+    with _state_lock:
+        if job_id not in _jobs:
+            job = _new_job_dict(CreateJobRequest.model_validate(payload))
+            job["id"] = job_id
+            _jobs[job_id] = job
+        return _public_job(_jobs[job_id])
+
+
+def _get_agent_mock_job(job_id):
+    with _state_lock:
+        _drain_queue()
+        job = _jobs.get(job_id)
+        return _public_job(job) if job else None
+
+
+def _queue_agent_mock_jobs(ids):
+    with _state_lock:
+        return _enqueue(ids)
+
+
+_agent_mock_service = AgentService(
+    AgentProjectStore(_scene_db._path), _create_agent_mock_job, _get_agent_mock_job, _queue_agent_mock_jobs,
+    lambda: list(dict.fromkeys([_AGENT_V2] + [m for values in _MODELS_BY_WORKLOAD.values() for m in values])))
+app.include_router(build_agent_router(lambda: _agent_mock_service, Path(_scene_db._path).parent / "assets", mock=True))
 
 if __name__ == "__main__":
     main()
