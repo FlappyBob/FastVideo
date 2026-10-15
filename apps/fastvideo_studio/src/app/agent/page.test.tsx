@@ -151,3 +151,11 @@ it('keeps an invalid settings shape out of the editable storyboard', async () =>
 		screen.getByRole('button', { name: 'Save storyboard' }),
 	).toBeDisabled();
 });
+
+it('does not discard unsaved work by creating a new story', async () => {
+	render(<AgentPage />);
+	fireEvent.change(await screen.findByDisplayValue('A lighthouse at night'), {
+		target: { value: 'Unsaved edit' },
+	});
+	expect(screen.getByRole('button', { name: /^New story$/ })).toBeDisabled();
+});

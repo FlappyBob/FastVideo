@@ -855,7 +855,7 @@ class JobRunner:
     def enqueue_job(self, job_id: str) -> Job:
         return self.enqueue_jobs([job_id])[0]
 
-    def enqueue_jobs(self, job_ids: list[str]) -> list[Job]:
+    def enqueue_jobs(self, job_ids: list[str], *, expected_jobs: dict[str, dict[str, Any]] | None = None) -> list[Job]:
         with self._condition:
             if self._closed:
                 raise ValueError("Job runner is shutting down")
@@ -871,6 +871,11 @@ class JobRunner:
                 job = self._jobs.get(job_id)
                 if job is None:
                     raise ValueError(f"Job {job_id} not found")
+                if expected_jobs is not None:
+                    expected = expected_jobs.get(job_id)
+                    actual = job.to_dict()
+                    if expected is None or any(actual.get(key) != value for key, value in expected.items()):
+                        raise ValueError("Job no longer matches approved storyboard inputs")
                 if job.status not in (JobStatus.PENDING, JobStatus.FAILED,
                                       JobStatus.STOPPED) or self._active_job is job:
                     raise ValueError(f"Job cannot start while {job.status.value}")

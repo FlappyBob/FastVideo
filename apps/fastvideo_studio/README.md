@@ -268,3 +268,89 @@ Each inference attempt writes into its own `attempt-<uuid>` directory. Exports
 also have unique filenames; exporting again cannot overwrite an earlier film.
 This first workbench release supports one executing job at a time. It does not
 claim automatic character consistency, agent planning, or multi-GPU scheduling.
+
+## Story agent workspace
+
+Open `/agent` for a persistent story, reference library and storyboard. The
+workspace supports manual editing, importing ViMax planning artifacts, optional
+LLM planning/revision, optional character-reference generation, bounded video
+submission, review, and export through the existing Studio executor.
+
+1. Create a story and write its brief and visual style.
+2. Plan with the configured model, import `{characters, shot_descriptions}` from
+   ViMax, or add/edit shots directly. Stable IDs preserve revision history.
+3. Upload reference images or generate a character portrait. Assign them to
+   characters and shots. A continuity link uses the preceding shot's last frame
+   as a **reference**, not as an exact first-frame constraint.
+4. Save and approve the storyboard, then set a new-job budget before generation.
+   Changing generation inputs invalidates approval and affected selected takes;
+   old takes remain available in the project record. Previously completed,
+   matching takes are reused. A rejected/failed take requires an explicit seed
+   change through **Request new take**.
+5. Review completed current takes, accept them, and export. A changed source
+   reference or mutated job configuration cannot reuse the original approval.
+
+The initial reference-bearing path uses full `MiniMaxAI/MiniMax-H3` Ref2VA.
+FastH3 V2 is T2AV-only and is rejected when a plan requires references. Model
+support does not prove that the default one-GPU recipe fits your hardware:
+configure the generation settings for your allocation and retain core checks.
+Character/scene continuity and visual quality still require real-model review.
+
+### Planner and image configuration
+
+Copy `agent_config.example.json` to a private path **outside the checkout** and
+replace its example URLs/models. Both endpoints use OpenAI-compatible HTTP
+contracts. The planner must support vision and JSON responses; uploaded images
+(up to nine) and story context are sent to that configured endpoint. The optional
+image endpoint must support `/images/generations` with `response_format=b64_json`.
+Remove the `image` block to use uploads only. Keys stay in the private file and
+are not returned by the app or saved in project records.
+
+```bash
+# From apps/, in the existing FastVideo environment:
+python -m fastvideo_studio.server --host 127.0.0.1 --port 8210 \
+  --data-dir /absolute/path/to/agent-data \
+  --output-dir /absolute/path/to/agent-videos \
+  --log-dir /absolute/path/to/agent-logs \
+  --agent-config /absolute/private/path/agent.json
+```
+
+Omit `--agent-config` for manual/import mode. No model requests are made just by
+opening the UI. Planner/image errors remain errors; there is no synthetic
+fallback in the real server. Image requests are not automatically retried after
+uncertain transport failures.
+
+For a remote machine, use the same-origin proxy and forward only the web port:
+
+```bash
+# From apps/fastvideo_studio; use the same variables for build and start.
+NEXT_PUBLIC_API_BASE_URL=/api STUDIO_API_PROXY_TARGET=http://127.0.0.1:8210 npm run dev -- --port 3010
+```
+
+For a production build, set those variables for `npm run build` and
+`npm run start -- --port 3010` too. Clear any older API URL override in Settings.
+Project/asset state is stored beside the Studio database and upload directory;
+keep both when moving a project. Use one Studio process, not multiple independent
+API workers sharing the same in-memory JobRunner.
+
+### Validation and limitations
+
+The mock server displays **Simulated generation** and uses synthetic clips. It
+can start without torch, Triton, or model weights; its attention catalogue is a
+fixed fixture, not production capability discovery. Browser tests must use the
+mock sentinel and must never run against a real GPU backend by accident.
+
+```bash
+python -m pytest apps/fastvideo_studio/tests/test_agent_project.py \
+  apps/fastvideo_studio/tests/test_agent_service.py \
+  apps/fastvideo_studio/tests/test_agent_routes.py \
+  apps/fastvideo_studio/tests/test_agent_planner.py -q
+# From apps/fastvideo_studio:
+npm test -- --run src/app/agent/page.test.tsx
+npm run e2e -- agent.spec.ts
+```
+
+The planner returns editable proposals; users approve generation and review
+media. There is no automatic cinematic-quality acceptance or claimed parity
+with Grok's proprietary models. Live LLM/image-provider and reference-conditioned
+GPU acceptance are separate from unit tests and the synthetic browser flow.

@@ -202,7 +202,7 @@ export default function AgentPage() {
 			<div className="grid gap-5 lg:grid-cols-[230px_1fr]">
 				<aside className="space-y-3">
 					<Button
-						disabled={busy}
+						disabled={busy || dirty}
 						className="w-full"
 						onClick={() =>
 							void perform(async () => {

@@ -1,0 +1,10 @@
+{
+  "base_url": "http://127.0.0.1:8000/v1",
+  "model": "<VISION_CAPABLE_PLANNER_MODEL>",
+  "api_key": "",
+  "image": {
+    "base_url": "http://127.0.0.1:8001/v1",
+    "model": "<IMAGE_MODEL>",
+    "api_key": ""
+  }
+}

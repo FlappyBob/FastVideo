@@ -135,7 +135,7 @@ def compile_jobs(plan: Blueprint, assets: dict, job_ids: dict[str, str]) -> dict
         asset_ids = list(dict.fromkeys(character_assets + shot.asset_ids))
         if any(key not in assets for key in asset_ids):
             raise ValueError(f'Shot {shot.id} references an unknown asset')
-        refs = [dict(source=assets[key]['path'], media_type='image') for key in asset_ids]
+        refs = [dict(source=assets[key]['path'], media_type='image', sha256=assets[key]['sha256']) for key in asset_ids]
         if shot.previous_shot_id:
             refs.append(dict(source=f'job-last-frame:{job_ids[shot.previous_shot_id]}', media_type='image'))
         if refs and plan.recipe.model_id != FULL_H3:
@@ -151,8 +151,8 @@ def compile_jobs(plan: Blueprint, assets: dict, job_ids: dict[str, str]) -> dict
         if shot.previous_shot_id:
             prompt += f'\nReference image {len(refs)} shows the preceding shot ending; maintain subject, setting and motion continuity.'
         output[shot.id] = dict(**plan.recipe.model_dump(),
-                               name=f'{plan.title} / {shot.title}',
-                               prompt=prompt,
+                               name=f'{plan.title} / {shot.title}'.strip(),
+                               prompt=prompt.strip(),
                                seed=shot.seed,
                                references=refs,
                                job_type='inference',

@@ -23,6 +23,51 @@ def finished(*jobs):
         time.sleep(.01)
 
 
+def test_agent_http_uses_real_runner_and_persists_completed_take(runner, monkeypatch):
+    """Exercise real request normalization/persistence/queue, replacing only GPU execution."""
+    from fastapi.testclient import TestClient
+    from fastvideo_studio import server
+    from fastvideo_studio.agent_project import V2
+
+    executed = []
+    persisted = threading.Event()
+    def run(job):
+        executed.append(job.id)
+        job.status = JobStatus.COMPLETED
+        runner._save_job(job)
+        persisted.set()
+
+    monkeypatch.setattr(runner, '_run_job', run)
+    monkeypatch.setattr(server, 'job_runner', runner, raising=False)
+    monkeypatch.setattr(server, 'database', runner._db, raising=False)
+    monkeypatch.setattr(server, '_agent_service', None)
+    monkeypatch.setattr(server, '_available_models', [{'id': V2}])
+    api = TestClient(server.app)
+    response = api.post('/api/agent/projects', json={
+        'title': 'Real runner contract',
+        'shots': [{'id': 'wide', 'title': 'Arrival', 'prompt': '  A lighthouse at dawn  '}],
+    })
+    assert response.status_code == 201
+    project = response.json()
+    prefix = '/api/agent/projects/' + project['id']
+    assert api.post(prefix + '/approve', json={'revision': 1}).status_code == 200
+    response = api.post(prefix + '/generate', json={'revision': 1, 'max_new_jobs': 1})
+    assert response.status_code == 200, response.text
+    job_id = response.json()['selected']['wide']
+    assert persisted.wait(8)
+    finished(runner.get_job(job_id))
+    assert executed == [job_id]
+    assert runner._db.get_job(job_id)['status'] == 'completed'
+    # Recreate the application service from SQLite; no new take may be submitted.
+    monkeypatch.setattr(server, '_agent_service', None)
+    assert api.post(prefix + '/generate', json={'revision': 1, 'max_new_jobs': 0}).status_code == 200
+    assert executed == [job_id]
+    assert api.post(prefix + '/review', json={
+        'shot_id': 'wide', 'job_id': job_id, 'verdict': 'accepted',
+    }).status_code == 200
+    assert api.get(prefix + '/export-jobs').json()['job_ids'] == [job_id]
+
+
 def test_reverse_submission_waits_for_predecessor(runner, monkeypatch):
     order=[]
     def run(job):
@@ -191,3 +236,11 @@ def test_fasth3_v2_reference_job_is_rejected_before_queueing(runner):
     with pytest.raises(ValueError, match='T2AV|reference'):
         runner.enqueue_job(job.id)
     assert job.status == JobStatus.PENDING
+
+
+def test_queue_checks_approved_payload_atomically(runner):
+    job=runner.create_job('approved','m','unapproved text')
+    with pytest.raises(ValueError,match='approved'):
+        runner.enqueue_jobs(['approved'],expected_jobs={'approved':{'prompt':'approved text'}})
+    assert job.status==JobStatus.PENDING
+    assert runner._db.get_job(job.id)['status']=='pending'

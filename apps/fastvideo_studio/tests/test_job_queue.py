@@ -276,3 +276,14 @@ class TestResolveClipReferences:
         assert dependency_of(after_clip("x")[0]) == "x"
         assert dependencies(after_clip("a") + after("a")) == ["a"]
         assert circular_dependency(jobs, "a") is not None
+
+
+def test_reference_digest_rechecked_at_execution(tmp_path):
+    import hashlib
+    from fastvideo_studio.job_queue import resolve_references, UnresolvedReference
+    path=tmp_path/'ref.png';path.write_bytes(b'original')
+    refs=[{'source':str(path),'media_type':'image','sha256':hashlib.sha256(b'original').hexdigest()}]
+    assert resolve_references(refs,lambda _:None,lambda _:None)==refs
+    path.write_bytes(b'replaced')
+    with pytest.raises(UnresolvedReference,match='reference|Reference'):
+        resolve_references(refs,lambda _:None,lambda _:None)

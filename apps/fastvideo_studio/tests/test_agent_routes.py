@@ -15,7 +15,7 @@ def client(tmp_path):
     def create(job_id,payload):
         jobs[job_id]=dict(id=job_id,status='pending',**payload)
         return jobs[job_id]
-    def enqueue(ids):
+    def enqueue(ids, **kwargs):
         for job_id in ids:jobs[job_id]['status']='queued'
     service=AgentService(AgentProjectStore(tmp_path/'db.sqlite'),create,jobs.get,enqueue,lambda:[V2])
     app=FastAPI();app.include_router(build_agent_router(lambda:service,tmp_path/'assets',mock=True))

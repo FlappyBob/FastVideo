@@ -1255,8 +1255,12 @@ def _get_agent_mock_job(job_id):
         return _public_job(job) if job else None
 
 
-def _queue_agent_mock_jobs(ids):
+def _queue_agent_mock_jobs(ids, *, expected_jobs=None):
     with _state_lock:
+        for job_id in ids:
+            if expected_jobs is not None and any(_jobs[job_id].get(key) != value
+                                                 for key, value in expected_jobs[job_id].items()):
+                raise ValueError("Job no longer matches approved storyboard inputs")
         return _enqueue(ids)
 
 

@@ -16,6 +16,8 @@ every job it takes an ending from has completed.
 
 from __future__ import annotations
 
+import hashlib
+
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -165,6 +167,22 @@ class UnresolvedReference(ValueError):
     """A deferred reference can't be turned into a real file."""
 
 
+def validate_reference_content(reference: Mapping[str, Any]) -> None:
+    """Check optional immutable-asset identity at admission and execution."""
+    expected = reference.get("sha256")
+    if expected is None:
+        return
+    try:
+        digest = hashlib.sha256()
+        with open(reference["source"], "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != expected:
+            raise UnresolvedReference("Reference content changed since approval; upload and approve it again")
+    except OSError as exc:
+        raise UnresolvedReference("Reference file is missing or unreadable") from exc
+
+
 def resolve_references(
     references: list[dict[str, Any]] | None,
     get_job: Callable[[str], Any],
@@ -206,4 +224,6 @@ def resolve_references(
         except Exception as exc:  # FrameError carries a readable .detail
             raise UnresolvedReference(str(getattr(exc, "detail", None) or exc)) from exc
         resolved.append({**ref, "source": path})
+    for reference in resolved:
+        validate_reference_content(reference)
     return resolved

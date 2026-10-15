@@ -8,6 +8,7 @@ import uuid
 from typing import Any
 
 from .agent_project import AgentProjectStore, Blueprint, compile_jobs
+from .job_queue import validate_reference_content
 
 
 class AgentService:
@@ -57,7 +58,21 @@ class AgentService:
         plan = Blueprint.model_validate(project['blueprint'])
         if plan.recipe.model_id not in self.model_ids():
             raise ValueError('Unknown model; select a registered Studio model')
-        return compile_jobs(plan, self.store.assets(project['id']), ids)
+        compiled = compile_jobs(plan, self.store.assets(project['id']), ids)
+        checked = set()
+        for payload in compiled.values():
+            for reference in payload['references']:
+                if reference.get('sha256') and reference['source'] not in checked:
+                    validate_reference_content(reference)
+                    checked.add(reference['source'])
+        return compiled
+
+    @staticmethod
+    def _assert_approved(job: dict[str, Any], expected: dict[str, Any]) -> None:
+        changed = [key for key, value in expected.items() if key != 'name' and job.get(key) != value]
+        if changed:
+            raise ValueError('Job no longer matches approved storyboard inputs; request a new take (' +
+                             ', '.join(changed) + ')')
 
     def approve(self, project_id: str, revision: int) -> dict[str, Any]:
         with self.lock:
@@ -83,6 +98,8 @@ class AgentService:
                                  if t['fingerprint'] == current and t['review'] != 'rejected'), None)
                 job_id = reusable['job_id'] if reusable else str(
                     uuid.uuid5(uuid.NAMESPACE_URL, f'fastvideo-agent:{project_id}:{key}:{current}'))
+                if any(t['job_id'] == job_id and t['review'] == 'rejected' for t in project['takes'].get(key, [])):
+                    raise ValueError('This take was rejected; request a new take by revising its seed')
                 job = self.get_job(job_id)
                 if reusable and not job:
                     raise ValueError(
@@ -95,6 +112,10 @@ class AgentService:
             if new_count > max_new_jobs:
                 raise ValueError(f'Generation budget is {max_new_jobs}, but {new_count} new jobs are required')
             compiled = self._admit(project, ids)
+            for shot_id, job_id in ids.items():
+                existing = self.get_job(job_id)
+                if existing is not None:
+                    self._assert_approved(existing, compiled[shot_id])
             operation_id = f'revision-{revision}'
 
             def reserve(current: dict[str, Any]) -> None:
@@ -108,10 +129,18 @@ class AgentService:
             for shot_id, job_id in ids.items():
                 if self.get_job(job_id) is None:
                     self.create_job(job_id, compiled[shot_id])
+                self._assert_approved(self.get_job(job_id), compiled[shot_id])
                 self.store.add_take(project_id, shot_id, job_id, project['fingerprints'][shot_id])
             waiting = [job_id for job_id in ids.values() if self.get_job(job_id)['status'] == 'pending']
             if waiting:
-                self.enqueue(waiting)
+                self.enqueue(waiting,
+                             expected_jobs={
+                                 ids[key]: {
+                                     field: value
+                                     for field, value in payload.items() if field != 'name'
+                                 }
+                                 for key, payload in compiled.items()
+                             })
             self.store.mutate(project_id, lambda current: current['operations'][operation_id].update(phase='submitted'))
             return self.store.get(project_id)
 
@@ -176,4 +205,7 @@ class AgentService:
             ordered.append(job_id)
         if not ordered:
             raise ValueError('No shots to export')
+        compiled = self._admit(project, project['selected'])
+        for shot_id, payload in compiled.items():
+            self._assert_approved(self.get_job(project['selected'][shot_id]), payload)
         return ordered
