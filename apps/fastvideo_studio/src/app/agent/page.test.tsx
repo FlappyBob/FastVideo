@@ -6,7 +6,19 @@ import { agentRequest } from '@/lib/agentApi';
 vi.mock('@/lib/agentApi', () => ({
 	agentRequest: vi.fn(),
 	assetUrl: () => '/asset',
+	keyframesUrl: () => '/keyframes',
+	renderUrl: (_project: string, filename: string) => `/renders/${filename}`,
 	uploadAgentAsset: vi.fn(),
+	uploadSoundtrack: vi.fn(),
+	DEFAULT_EDIT: {
+		in_seconds: 0,
+		out_seconds: null,
+		transition: 'cut',
+		transition_seconds: 0.5,
+		caption: '',
+		caption_start: 0,
+		caption_end: null,
+	},
 }));
 vi.mock('@/lib/api', () => ({
 	getJobVideoUrl: () => '/video',
@@ -29,7 +41,10 @@ const makeProject = () => ({
 			num_frames: 124,
 			fps: 24,
 			num_inference_steps: 9,
+			tier: 'preview',
 		},
+		soundtrack: { asset_id: null, gain_db: -14, duck: true, fade_out_seconds: 2 },
+		captions: { font_size: 44, position: 'bottom' },
 		shots: [
 			{
 				id: 'one',
@@ -39,6 +54,15 @@ const makeProject = () => ({
 				asset_ids: [],
 				previous_shot_id: null,
 				seed: 1024,
+				edit: {
+					in_seconds: 0,
+					out_seconds: null,
+					transition: 'cut',
+					transition_seconds: 0.5,
+					caption: '',
+					caption_start: 0,
+					caption_end: null,
+				},
 			},
 		],
 	},
@@ -48,6 +72,14 @@ const makeProject = () => ({
 	selected: {},
 	messages: [],
 	stale_shots: [],
+	timing: {
+		operations: {},
+		generation_seconds: 0,
+		queue_wait_seconds: 0,
+		final_takes: 0,
+		preview_takes: 0,
+	},
+	renders: [],
 });
 let project: ReturnType<typeof makeProject>;
 beforeEach(() => {
@@ -59,6 +91,8 @@ beforeEach(() => {
 				mock: true,
 				models: [project.blueprint.recipe.model_id, 'MiniMaxAI/MiniMax-H3'],
 				reference_model: 'MiniMaxAI/MiniMax-H3',
+				tiers: ['preview', 'final'],
+				caption_font: true,
 			};
 		if (path === '/projects') return [project];
 		if (path.endsWith('/approve')) {
@@ -158,4 +192,78 @@ it('does not discard unsaved work by creating a new story', async () => {
 		target: { value: 'Unsaved edit' },
 	});
 	expect(screen.getByRole('button', { name: /^New story$/ })).toBeDisabled();
+});
+
+it('switching the render tier is a saved storyboard change, not a hidden setting', async () => {
+	render(<AgentPage />);
+	await screen.findByDisplayValue('A lighthouse at night');
+	fireEvent.change(screen.getByLabelText('Render tier'), {
+		target: { value: 'final' },
+	});
+	expect(
+		(screen.getByLabelText('Recipe JSON') as HTMLTextAreaElement).value,
+	).toContain('"tier": "final"');
+	fireEvent.click(screen.getByRole('button', { name: 'Save storyboard' }));
+	await waitFor(() =>
+		expect(agentRequest).toHaveBeenCalledWith(
+			'/projects/project',
+			'PUT',
+			expect.objectContaining({
+				blueprint: expect.objectContaining({
+					recipe: expect.objectContaining({ tier: 'final' }),
+				}),
+			}),
+		),
+	);
+});
+
+it('renders a cut only from accepted takes and shows the timeline', async () => {
+	project.jobs = { job1: { id: 'job1', status: 'completed' } as never };
+	project.selected = { one: 'job1' };
+	project.takes = {
+		one: [
+			{
+				job_id: 'job1',
+				fingerprint: 'f',
+				review: 'accepted',
+				note: '',
+				tier: 'preview',
+				observation: {
+					probe: { width: 544, height: 320, fps: 24, video_seconds: 5.17 },
+					motion: { frames: 124, static_seconds: [0, 1, 2, 3], jumps_at: [] },
+					flags: ['mostly_static'],
+					keyframe_times: [0, 1],
+				},
+			},
+		],
+	};
+	vi.mocked(agentRequest).mockImplementation(async (path, method) => {
+		if (path === '/config')
+			return { planner_configured: false, mock: true, models: [], reference_model: 'x' };
+		if (path === '/projects') return [project];
+		if (path.endsWith('/cut/render') && method === 'POST')
+			return {
+				filename: 'demo-cut.mp4',
+				clips: 1,
+				seconds: 4.5,
+				revision: 1,
+				render_seconds: 2.25,
+				timeline: [{ label: 'Opening', start: 0, seconds: 4.5, transition: 'cut' }],
+			};
+		return project;
+	});
+	render(<AgentPage />);
+	await screen.findByDisplayValue('A lighthouse at night');
+	expect(screen.getByText('Mostly static')).toBeInTheDocument();
+	expect(screen.getByAltText('Key frames of Opening')).toHaveAttribute('src', '/keyframes');
+	expect(screen.getByRole('button', { name: 'Propose cut' })).toBeDisabled();
+	fireEvent.click(screen.getByRole('button', { name: 'Render cut' }));
+	await waitFor(() =>
+		expect(agentRequest).toHaveBeenCalledWith('/projects/project/cut/render', 'POST'),
+	);
+	expect(await screen.findByRole('link', { name: 'Download cut' })).toHaveAttribute(
+		'href',
+		'/renders/demo-cut.mp4',
+	);
+	expect(screen.getByText(/0\.0 s Opening/)).toBeInTheDocument();
 });

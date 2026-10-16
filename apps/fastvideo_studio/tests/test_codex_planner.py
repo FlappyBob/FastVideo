@@ -63,3 +63,29 @@ Path(sys.argv[sys.argv.index('--output-last-message')+1]).write_text('not json')
 ''')
     with pytest.raises(ValueError, match='JSON'):
         configured(tmp_path, program)({}, 'plan', None, assets={})
+
+
+def test_codex_cut_mode_uses_editorial_schema_and_attaches_keyframes(tmp_path):
+    from PIL import Image
+    sheet = tmp_path / 'sheet.jpg'
+    Image.new('RGB', (8, 8)).save(sheet)
+    program = executable(tmp_path, '''import json,sys
+from pathlib import Path
+args=sys.argv[1:]
+prompt=sys.stdin.read()
+assert 'film editor' in prompt and '"take_seconds"' in prompt
+images=[args[i+1] for i,a in enumerate(args) if a=='--image']
+assert len(images)==1 and images[0].endswith('.jpg') and Path(images[0]).is_file()
+schema=json.loads(Path(args[args.index('--output-schema')+1]).read_text())
+assert 'edit' in schema['properties']['shots']['items']['properties']
+assert 'asset_id' not in schema['properties']['soundtrack']['properties']
+Path(args[args.index('--output-last-message')+1]).write_text(json.dumps({
+ 'shots':[{'id':'a','edit':{'out_seconds':3}}],'soundtrack':{'gain_db':-12},'rationale':'trim'}))
+''')
+    planner = configured(tmp_path, program)
+    result = planner({'title': 'Story', 'recipe': {}, 'shots': [{'id': 'a'}]}, 'tighten', None, assets={},
+                     observations={'a': [{'job_id': 'j', 'selected': True, 'status': 'completed', 'review': 'pending',
+                                          'note': '', 'tier': 'final', 'observation': {'seconds': 5},
+                                          'keyframes_path': str(sheet)}]},
+                     mode='cut', durations={'a': 5.0})
+    assert result['shots'][0]['edit']['out_seconds'] == 3

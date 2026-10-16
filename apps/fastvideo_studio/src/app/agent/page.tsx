@@ -7,10 +7,15 @@ import { Button } from '@/components/ui/button';
 import { getMergedVideoUrl, mergeScene } from '@/lib/api';
 import {
 	agentRequest,
+	renderUrl,
+	uploadSoundtrack,
+	DEFAULT_EDIT,
 	type AgentConfig,
+	type RenderRecord,
 	type StoryBlueprint,
 	type StoryProject,
 	type StoryShot,
+	type Tier,
 } from '@/lib/agentApi';
 
 const FIELD =
@@ -31,6 +36,11 @@ export default function AgentPage() {
 	const [exportUrl, setExportUrl] = React.useState<string | null>(null);
 	const [recipeText, setRecipeText] = React.useState('');
 	const [recipeError, setRecipeError] = React.useState(false);
+	const [cutInstruction, setCutInstruction] = React.useState('');
+	const [render, setRender] = React.useState<{
+		project: string;
+		record: RenderRecord;
+	} | null>(null);
 
 	const install = React.useCallback((value: StoryProject) => {
 		setProject(value);
@@ -39,6 +49,13 @@ export default function AgentPage() {
 		setRecipeError(false);
 		setRecipeText(JSON.stringify(value.blueprint.recipe, null, 2));
 		setExportUrl(null);
+		setRender((previous) =>
+			value.renders?.length
+				? { project: value.id, record: value.renders[value.renders.length - 1] }
+				: previous?.project === value.id
+					? previous
+					: null,
+		);
 	}, []);
 	const load = React.useCallback(
 		async (id: string) => {
@@ -410,6 +427,7 @@ export default function AgentPage() {
 													asset_ids: [],
 													previous_shot_id: null,
 													seed: 1024 + v.shots.length,
+													edit: { ...DEFAULT_EDIT },
 												});
 											})
 										}
@@ -482,6 +500,98 @@ export default function AgentPage() {
 									/>
 								</label>
 							</div>
+							<div className="mt-3 grid gap-3 md:grid-cols-[180px_1fr_160px]">
+								<label className="text-sm">
+									Render tier
+									<select
+										className={FIELD}
+										disabled={busy || active}
+										value={draft.recipe.tier ?? 'final'}
+										onChange={(e) => {
+											const recipe = {
+												...draft.recipe,
+												tier: e.target.value as Tier,
+											};
+											edit((v) => {
+												v.recipe = recipe;
+											});
+											setRecipeText(JSON.stringify(recipe, null, 2));
+										}}
+									>
+										<option value="preview">Preview (smaller canvas)</option>
+										<option value="final">Final (full canvas)</option>
+									</select>
+								</label>
+								<label className="text-sm">
+									Soundtrack
+									<div className="flex items-center gap-2">
+										<select
+											className={FIELD}
+											disabled={busy || active}
+											value={draft.soundtrack?.asset_id ?? ''}
+											onChange={(e) =>
+												edit((v) => {
+													v.soundtrack = {
+														...v.soundtrack,
+														asset_id: e.target.value || null,
+													};
+												})
+											}
+										>
+											<option value="">None (generated audio only)</option>
+											{project.assets
+												?.filter((a) => a.kind === 'audio')
+												.map((a) => (
+													<option key={a.id} value={a.id}>
+														{a.name}
+														{a.seconds ? ` · ${Math.round(a.seconds)} s` : ''}
+													</option>
+												))}
+										</select>
+										<label className="cursor-pointer whitespace-nowrap rounded-lg border px-3 py-2 text-sm">
+											Upload music
+											<input
+												aria-label="Upload music"
+												type="file"
+												accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg"
+												className="sr-only"
+												disabled={busy || dirty || active}
+												onChange={(e) => {
+													const file = e.target.files?.[0];
+													if (file)
+														void perform(() => uploadSoundtrack(project.id, file));
+													e.target.value = '';
+												}}
+											/>
+										</label>
+									</div>
+								</label>
+								<label className="text-sm">
+									Music level (dB)
+									<input
+										type="number"
+										min={-40}
+										max={6}
+										step={1}
+										className={FIELD}
+										disabled={busy || active}
+										value={draft.soundtrack?.gain_db ?? -14}
+										onChange={(e) =>
+											edit((v) => {
+												v.soundtrack = {
+													...v.soundtrack,
+													gain_db: Number(e.target.value) || 0,
+												};
+											})
+										}
+									/>
+								</label>
+							</div>
+							<p className="mt-2 text-xs text-muted-foreground">
+								Preview renders the same prompts and seeds on a smaller canvas. A
+								final render of a shot waits until one of its previews is
+								accepted. Music is ducked under generated audio and faded out.
+							</p>
 							{unsupported && (
 								<p role="status" className="mt-3 text-sm text-amber-600">
 									Visual references require the full MiniMax H3 model. FastH3 V2
@@ -609,7 +719,57 @@ export default function AgentPage() {
 								>
 									Export accepted shots
 								</Button>
+								<Button
+									disabled={busy || dirty || !canExport}
+									onClick={() =>
+										void perform(async () => {
+											const result = await agentRequest<RenderRecord>(
+												`/projects/${project.id}/cut/render`,
+												'POST',
+											);
+											setRender({ project: project.id, record: result });
+										})
+									}
+								>
+									Render cut
+								</Button>
 							</div>
+							<div className="mt-3 grid gap-2 md:grid-cols-[1fr_160px]">
+								<input
+									aria-label="Cut instruction"
+									className={FIELD}
+									value={cutInstruction}
+									disabled={busy || dirty || !config?.planner_configured}
+									onChange={(e) => setCutInstruction(e.target.value)}
+									placeholder="Tighten the opening, dip to black before the last shot…"
+								/>
+								<Button
+									variant="outline"
+									disabled={
+										busy || dirty || active || !config?.planner_configured
+									}
+									onClick={() =>
+										void perform(() =>
+											agentRequest(`/projects/${project.id}/cut/propose`, 'POST', {
+												revision: project.revision,
+												instruction: cutInstruction,
+											}),
+										)
+									}
+								>
+									Propose cut
+								</Button>
+							</div>
+							{project.timing && (
+								<p className="mt-2 text-xs text-muted-foreground">
+									Timing · generation {project.timing.generation_seconds} s ·
+									queue wait {project.timing.queue_wait_seconds} s · planning{' '}
+									{project.timing.operations.plan ?? 0} s · render{' '}
+									{project.timing.operations.render ?? 0} s ·{' '}
+									{project.timing.preview_takes} preview /{' '}
+									{project.timing.final_takes} final takes completed
+								</p>
+							)}
 							<p className="mt-3 text-xs text-muted-foreground">
 								Revision {project.revision} ·{' '}
 								{project.approved_revision === project.revision
@@ -619,9 +779,41 @@ export default function AgentPage() {
 								{active ? ' · Generation active; editing is paused' : ''}
 							</p>
 						</section>
+						{render?.project === project.id && (
+							<section className="rounded-xl border p-5">
+								<h2 className="mb-3 font-semibold">
+									Rendered cut{' '}
+									<span className="text-sm font-normal text-muted-foreground">
+										{render.record.clips} shots ·{' '}
+										{render.record.seconds.toFixed(1)} s · rendered in{' '}
+										{render.record.render_seconds.toFixed(1)} s
+									</span>
+								</h2>
+								<video
+									controls
+									src={renderUrl(project.id, render.record.filename)}
+									className="max-h-[60vh] w-full bg-black"
+								/>
+								<ol className="mt-2 flex flex-wrap gap-3 text-xs text-muted-foreground">
+									{render.record.timeline.map((item) => (
+										<li key={`${item.label}-${item.start}`}>
+											{item.start.toFixed(1)} s {item.label}
+											{item.transition !== 'cut' ? ` (${item.transition})` : ''}
+										</li>
+									))}
+								</ol>
+								<a
+									href={renderUrl(project.id, render.record.filename)}
+									download
+									className="mt-3 inline-block text-sm underline"
+								>
+									Download cut
+								</a>
+							</section>
+						)}
 						{exportUrl && (
 							<section className="rounded-xl border p-5">
-								<h2 className="mb-3 font-semibold">Your film</h2>
+								<h2 className="mb-3 font-semibold">Raw join</h2>
 								<video
 									controls
 									src={exportUrl}

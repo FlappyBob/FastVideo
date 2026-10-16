@@ -15,6 +15,7 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 from .agent_project import Blueprint, FULL_H3, import_vimax
+from .edit_render import find_caption_font
 
 
 class RevisionRequest(BaseModel):
@@ -49,6 +50,13 @@ class ImportRequest(RevisionRequest):
     payload: dict
 
 
+class CutRequest(RevisionRequest):
+    instruction: str = Field(default='', max_length=12000)
+
+
+AUDIO_LIMIT = 40 * 1024 * 1024
+
+
 def _call(callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     try:
         return callback(*args, **kwargs)
@@ -71,7 +79,9 @@ def build_agent_router(get_service, assets_dir, *, mock=False):
                     mock=mock,
                     reference_model=FULL_H3,
                     models=service.model_ids(),
-                    max_shots=32)
+                    max_shots=32,
+                    caption_font=find_caption_font() is not None,
+                    tiers=['preview', 'final'])
 
     @router.get('/projects')
     def projects():
@@ -117,6 +127,77 @@ def build_agent_router(get_service, assets_dir, *, mock=False):
     def export(project_id: str):
         return dict(job_ids=_call(get_service().export_jobs, project_id))
 
+    @router.get('/projects/{project_id}/timing')
+    def timing(project_id: str):
+        service = get_service()
+        return _call(lambda: service.timing(service.store.get(project_id)))
+
+    @router.get('/projects/{project_id}/takes/{shot_id}/{job_id}')
+    def take(project_id: str, shot_id: str, job_id: str):
+        record = _call(get_service().observe, project_id, shot_id, job_id)
+        record['keyframes_url'] = f'/api/agent/projects/{project_id}/takes/{shot_id}/{job_id}/keyframes'
+        return {key: value for key, value in record.items() if key != 'keyframes_path'}
+
+    @router.get('/projects/{project_id}/takes/{shot_id}/{job_id}/keyframes')
+    def keyframes(project_id: str, shot_id: str, job_id: str):
+        path = _call(get_service().keyframes_path, project_id, shot_id, job_id)
+        return FileResponse(path, media_type='image/jpeg')
+
+    @router.post('/projects/{project_id}/cut/propose')
+    def propose_cut(project_id: str, request: CutRequest):
+        return _call(get_service().propose_cut, project_id, request.revision, request.instruction)
+
+    @router.post('/projects/{project_id}/cut/render')
+    def render_cut(project_id: str):
+        result = _call(get_service().render, project_id)
+        result['url'] = f'/api/agent/projects/{project_id}/renders/{result["filename"]}'
+        return result
+
+    @router.get('/projects/{project_id}/renders/{filename}')
+    def render_file(project_id: str, filename: str):
+        if '/' in filename or not filename.endswith('.mp4'):
+            raise HTTPException(404, 'Render not found')
+        return FileResponse(_call(get_service().render_path, project_id, filename), media_type='video/mp4')
+
+    @router.post('/projects/{project_id}/soundtrack', status_code=201)
+    async def upload_soundtrack(project_id: str, file: UploadFile):
+        service = get_service()
+        _call(service.store.get, project_id)
+        raw = await file.read(AUDIO_LIMIT + 1)
+        if len(raw) > AUDIO_LIMIT:
+            raise HTTPException(413, 'Soundtrack exceeds 40 MiB')
+        suffix = Path(file.filename or '').suffix.lower()
+        if suffix not in {'.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg'}:
+            raise HTTPException(422, 'Use an MP3, WAV, M4A, AAC, FLAC or OGG file')
+        asset_id = uuid.uuid4().hex
+        directory = Path(assets_dir() if callable(assets_dir) else assets_dir) / project_id
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f'{asset_id}{suffix}'
+        path.write_bytes(raw)
+        try:
+            import av
+            with av.open(str(path)) as container:
+                stream = next((s for s in container.streams if s.type == 'audio'), None)
+                if stream is None:
+                    raise ValueError('no audio stream')
+                seconds = float(stream.duration * stream.time_base) if stream.duration else (
+                    container.duration / 1_000_000 if container.duration else 0.0)
+        except Exception as exc:
+            path.unlink(missing_ok=True)
+            raise HTTPException(422, 'Could not decode the soundtrack as audio') from exc
+        asset = dict(id=asset_id,
+                     name=(file.filename or 'Soundtrack')[:200],
+                     path=str(path.resolve()),
+                     sha256=hashlib.sha256(raw).hexdigest(),
+                     kind='audio',
+                     seconds=round(seconds, 3))
+        try:
+            service.store.add_asset(project_id, asset)
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+        return {key: value for key, value in asset.items() if key != 'path'}
+
     def store_image(project_id: str, raw: bytes, name: str):
         service = get_service()
         _call(service.store.get, project_id)
@@ -143,6 +224,7 @@ def build_agent_router(get_service, assets_dir, *, mock=False):
                      name=name[:200],
                      path=str(path.resolve()),
                      sha256=hashlib.sha256(data).hexdigest(),
+                     kind='image',
                      width=width,
                      height=height)
         try:
@@ -183,6 +265,8 @@ def build_agent_router(get_service, assets_dir, *, mock=False):
         assets = _call(get_service().store.assets, project_id)
         if asset_id not in assets or not Path(assets[asset_id]['path']).is_file():
             raise HTTPException(404, 'Asset not found')
+        if assets[asset_id].get('kind', 'image') != 'image':
+            return FileResponse(assets[asset_id]['path'])
         return FileResponse(assets[asset_id]['path'], media_type='image/png')
 
     return router

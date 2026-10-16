@@ -990,7 +990,9 @@ def _get_agent_service():
                                       job_runner.enqueue_jobs,
                                       lambda: [m["id"] for m in _available_models],
                                       planner=_story_planner,
-                                      image_generator=_reference_generator)
+                                      image_generator=_reference_generator,
+                                      cache_dir=os.path.join(upload_dir, "agent-observations"),
+                                      output_dir=job_runner.output_dir)
     return _agent_service
 
 

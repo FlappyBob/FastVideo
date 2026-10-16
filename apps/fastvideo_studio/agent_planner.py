@@ -22,7 +22,51 @@ it does not guarantee an exact first frame. Dependencies must be acyclic. Includ
 establishing/context shots; do not turn every cut into one unbroken camera movement.
 When revising one target shot, preserve its ID and all other shots and characters. Never propose shell commands,
 API URLs, filesystem paths, hardware configuration or model settings. The result must remain editable.
-If a request cannot be represented, return {"error":"a clear reason"} rather than claiming success.'''
+If a request cannot be represented, return {"error":"a clear reason"} rather than claiming success.
+When "observations" are supplied they describe real generated takes: duration, per-second motion, hidden
+cuts, audio levels, reviewer verdicts and notes, plus timestamped key-frame sheets as images. Base revisions
+on what was actually generated, cite the shot and time you are reacting to, and never claim a defect is fixed
+by removing the action that exposed it. Each shot's "edit" field is editorial and must be returned unchanged
+unless the instruction is about the cut.'''
+
+_CUT_SYSTEM = '''You are a film editor. You receive a storyboard, observations of the selected take of each shot
+(duration in seconds, per-second motion, detected hidden cuts, audio levels, key-frame sheets as images) and the
+editor's instruction. Return one JSON object, without markdown:
+{"shots":[{"id":"<existing shot id>","edit":{"in_seconds":0,"out_seconds":null,"transition":"cut",
+"transition_seconds":0.5,"caption":"","caption_start":0,"caption_end":null}}],
+ "soundtrack":{"gain_db":-14,"duck":true,"fade_out_seconds":2},"rationale":"one short paragraph"}.
+Rules: keep every shot id and order; in/out are seconds within that shot's own take and must leave at least
+0.5 s; cut before static tails and after the key action completes; avoid a hidden cut by trimming around it;
+"transition" is how a shot joins the previous one (cut, crossfade, fade_black), the first shot's transition is
+ignored; captions are optional, short, and timed within the kept range; do not invent new shots, prompts,
+seeds, model or hardware settings. If the takes are unusable for a cut, return {"error":"a clear reason"}.'''
+
+
+def planner_context(current: dict, instruction: str, target: str | None, *, assets: dict, observations: dict | None,
+                    mode: str, durations: dict | None) -> tuple[dict, list[dict]]:
+    """Text payload and bounded image list (reference assets, then key-frame sheets) for any planner."""
+    creative = {key: value for key, value in current.items() if key != 'recipe'}
+    catalog = [{key: value for key, value in asset.items() if key != 'path'} for asset in assets.values()]
+    images: list[dict] = []
+    for asset in assets.values():
+        if asset.get('kind', 'image') == 'image' and len(images) < 9:
+            images.append(dict(label=f'Reference asset {asset["id"]}: {asset["name"]}', path=asset['path']))
+    context: dict[str, Any] = {}
+    for shot_id, entries in (observations or {}).items():
+        context[shot_id] = []
+        for entry in entries:
+            item = {key: value for key, value in entry.items() if key != 'keyframes_path'}
+            if entry.get('keyframes_path') and entry.get('selected') and len(images) < 9:
+                item['keyframes_image'] = f'image {len(images) + 1}'
+                images.append(dict(label=f'Key frames of shot {shot_id}, take {entry["job_id"]}',
+                                   path=entry['keyframes_path']))
+            context[shot_id].append(item)
+    payload = dict(current=creative, instruction=instruction, target_shot_id=target, assets=catalog)
+    if context:
+        payload['observations'] = context
+    if mode == 'cut':
+        payload['take_seconds'] = durations or {}
+    return payload, images
 
 
 class StoryPlanner:
@@ -38,27 +82,34 @@ class StoryPlanner:
         if not self.model or '<' in self.model:
             raise ValueError('Configure a real planner model')
 
-    def __call__(self, current: dict, instruction: str, target: str | None, *, assets: dict):
-        creative = {key: value for key, value in current.items() if key != 'recipe'}
-        catalog = [{key: value for key, value in asset.items() if key != 'path'} for asset in assets.values()]
-        content: list[dict[str, Any]] = [
-            dict(type='text',
-                 text=json.dumps(dict(current=creative, instruction=instruction, target_shot_id=target, assets=catalog),
-                                 ensure_ascii=False))
-        ]
+    def __call__(self,
+                 current: dict,
+                 instruction: str,
+                 target: str | None,
+                 *,
+                 assets: dict,
+                 observations: dict | None = None,
+                 mode: str = 'story',
+                 durations: dict | None = None):
+        payload, images = planner_context(current, instruction, target, assets=assets, observations=observations,
+                                          mode=mode, durations=durations)
+        content: list[dict[str, Any]] = [dict(type='text', text=json.dumps(payload, ensure_ascii=False))]
         # Bounded image context; remaining assets retain their descriptive catalog.
-        for asset in list(assets.values())[:9]:
-            content.append(dict(type='text', text=f'Reference asset {asset["id"]}: {asset["name"]}'))
-            data = base64.b64encode(Path(asset['path']).read_bytes()).decode()
-            content.append(dict(type='image_url', image_url=dict(url=f'data:image/png;base64,{data}')))
+        for image in images:
+            content.append(dict(type='text', text=image['label']))
+            suffix = Path(image['path']).suffix.lower()
+            mime = 'image/jpeg' if suffix in {'.jpg', '.jpeg'} else 'image/png'
+            data = base64.b64encode(Path(image['path']).read_bytes()).decode()
+            content.append(dict(type='image_url', image_url=dict(url=f'data:{mime};base64,{data}')))
         headers = {'Authorization': f'Bearer {self.api_key}'} if self.api_key else {}
+        system = _CUT_SYSTEM if mode == 'cut' else _SYSTEM
         try:
             with httpx.Client(timeout=120, transport=self.transport) as client:
                 response = client.post(
                     self.base_url + '/chat/completions',
                     headers=headers,
                     json=dict(model=self.model,
-                              messages=[dict(role='system', content=_SYSTEM),
+                              messages=[dict(role='system', content=system),
                                         dict(role='user', content=content)],
                               response_format=dict(type='json_object'),
                               max_tokens=6000))

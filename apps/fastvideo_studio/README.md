@@ -296,6 +296,64 @@ support does not prove that the default one-GPU recipe fits your hardware:
 configure the generation settings for your allocation and retain core checks.
 Character/scene continuity and visual quality still require real-model review.
 
+### Preview tier, observation, editorial cut
+
+The storyboard's recipe carries a `tier`. **Preview** renders the same prompts
+and seeds on a smaller canvas (two thirds of each edge, on the 32-pixel grid
+the H3 family requires; H3's five-second minimum means frame counts do not
+shrink). **Final** uses the full canvas. The tier is part of each take's
+fingerprint, so previews and finals are separate takes, and a final take for a
+shot is admitted only after one of that shot's previews with identical content
+has been accepted. A shot that has never been previewed can still go straight
+to final. Whether a preview predicts its final is a model property; check it on
+your hardware before relying on it.
+
+Every completed take can be **observed** (`GET /api/agent/projects/{id}/takes/{shot}/{job}`):
+stream facts, a per-second motion profile, detected hard jumps, audio levels, a
+timestamped key-frame sheet (`…/keyframes`, JPEG) and conservative flags such
+as `mostly_static`, `possible_hidden_cut`, `no_audio_track`. The workspace shows
+the sheet and flags under each take; the planner receives the same summary and
+up to nine images (reference assets first, then the selected takes' sheets) so
+revisions react to what was generated. Flags are hints for review and never
+accept or reject a take.
+
+Each shot has **edit decisions** (in/out seconds, transition from the previous
+shot: cut, crossfade or dip to black, a burned-in caption with its window) and
+the story has a **soundtrack** (uploaded through `POST …/soundtrack`, mixed
+under the generated audio with side-chain ducking, a level in dB and a fade-out)
+and a caption style. Editorial fields are not generation inputs: saving them
+bumps the revision but keeps the approval and every take. **Render cut**
+(`POST …/cut/render`) re-encodes the accepted takes through one ffmpeg filter
+graph into `<output-dir>/merged/<title>-cut-….mp4`; **Export accepted shots**
+remains the lossless stream-copy join. Captions need a font with the right
+glyphs; the server picks a CJK-capable system font when present or
+`FASTVIDEO_CAPTION_FONT`. With a planner configured, **Propose cut**
+(`POST …/cut/propose`) asks it for editorial decisions only, validated against
+the real take durations.
+
+`GET …/timing` and the `timing` block of a project report where wall-clock time
+went: planner latency, queue wait, generation, observation and render seconds,
+and how many preview and final takes completed. Use it to compare a
+preview-then-final workflow with direct finals on the same brief.
+
+### Driving the workspace from an external agent (MCP)
+
+```bash
+# From apps/, in the FastVideo environment, against a running Studio API:
+python -m fastvideo_studio.agent_mcp --api http://127.0.0.1:8210/api
+```
+
+Register that command as a stdio MCP server (for example in Claude Code's
+`.mcp.json` or Codex's MCP settings). Tools: `list_projects`, `create_project`,
+`get_project`, `save_blueprint`, `propose_plan`, `approve`, `generate`,
+`wait_for_takes`, `get_take` (observation plus the key-frame image), `review`,
+`propose_cut`, `render_cut`, `get_timing`. Every call goes through the HTTP API,
+so revision checks, budgets, the approval requirement and the preview gate all
+still apply, and a server rejection comes back as `{"error": …}` the agent can
+read. Approving a storyboard and accepting a final take remain decisions a
+person should make; the tools exist so an agent can plan, look, propose and
+re-plan, not so it can sign off on its own work.
+
 ### Planner and image configuration
 
 Copy `agent_config.example.json` to a private path **outside the checkout** and
@@ -375,7 +433,10 @@ mock sentinel and must never run against a real GPU backend by accident.
 python -m pytest apps/fastvideo_studio/tests/test_agent_project.py \
   apps/fastvideo_studio/tests/test_agent_service.py \
   apps/fastvideo_studio/tests/test_agent_routes.py \
-  apps/fastvideo_studio/tests/test_agent_planner.py -q
+  apps/fastvideo_studio/tests/test_agent_planner.py \
+  apps/fastvideo_studio/tests/test_observe.py \
+  apps/fastvideo_studio/tests/test_edit_render.py \
+  apps/fastvideo_studio/tests/test_agent_mcp.py -q
 # From apps/fastvideo_studio:
 npm test -- --run src/app/agent/page.test.tsx
 npm run e2e -- agent.spec.ts

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .agent_project import Blueprint
-from .agent_planner import _SYSTEM
+from .agent_planner import _CUT_SYSTEM, _SYSTEM, planner_context
 
 
 def _strict_schema(node: Any) -> Any:
@@ -23,6 +23,20 @@ def _strict_schema(node: Any) -> Any:
         result['additionalProperties'] = False
         result['required'] = list(result.get('properties', {}))
     return result
+
+
+def _cut_schema() -> dict[str, Any]:
+    from .agent_project import ShotEdit, Soundtrack
+
+    edit = ShotEdit.model_json_schema()
+    soundtrack = Soundtrack.model_json_schema()
+    soundtrack['properties'].pop('asset_id', None)
+    return dict(type='object',
+                properties=dict(shots=dict(type='array',
+                                           items=dict(type='object',
+                                                      properties=dict(id=dict(type='string'), edit=edit))),
+                                soundtrack=soundtrack,
+                                rationale=dict(type='string')))
 
 
 class CodexPlanner:
@@ -38,14 +52,27 @@ class CodexPlanner:
         if not 1 <= self.timeout <= 900:
             raise ValueError('Codex timeout_seconds must be between 1 and 900')
 
-    def __call__(self, current: dict, instruction: str, target: str | None, *, assets: dict) -> dict:
-        creative = {key: value for key, value in current.items() if key != 'recipe'}
-        catalog = [{key: value for key, value in asset.items() if key != 'path'} for asset in assets.values()]
-        prompt = _SYSTEM + '\nDo not use tools. Return only the storyboard JSON.\n' + json.dumps(
-            dict(current=creative, instruction=instruction, target_shot_id=target, assets=catalog), ensure_ascii=False)
-        schema = Blueprint.model_json_schema()
-        schema['properties'].pop('recipe')
-        schema.get('$defs', {}).pop('Recipe', None)
+    def __call__(self,
+                 current: dict,
+                 instruction: str,
+                 target: str | None,
+                 *,
+                 assets: dict,
+                 observations: dict | None = None,
+                 mode: str = 'story',
+                 durations: dict | None = None) -> dict:
+        payload, images = planner_context(current, instruction, target, assets=assets, observations=observations,
+                                          mode=mode, durations=durations)
+        if images:
+            payload['attached_images'] = [f'image {index + 1}: {image["label"]}' for index, image in enumerate(images)]
+        system = _CUT_SYSTEM if mode == 'cut' else _SYSTEM
+        prompt = system + '\nDo not use tools. Return only the JSON object.\n' + json.dumps(payload, ensure_ascii=False)
+        if mode == 'cut':
+            schema = _cut_schema()
+        else:
+            schema = Blueprint.model_json_schema()
+            schema['properties'].pop('recipe')
+            schema.get('$defs', {}).pop('Recipe', None)
         with tempfile.TemporaryDirectory(prefix='studio-codex-plan-') as directory:
             root = Path(directory)
             schema_path, answer = root / 'schema.json', root / 'answer.json'
@@ -71,10 +98,10 @@ class CodexPlanner:
                 command.extend(['--disable', feature])
             if self.model:
                 command.extend(['--model', str(self.model)])
-            for index, asset in enumerate(list(assets.values())[:9]):
-                # Supply only explicit project assets, without repository context.
-                image = root / f'reference-{index}.png'
-                shutil.copyfile(asset['path'], image)
+            for index, item in enumerate(images):
+                # Supply only explicit project media, without repository context.
+                image = root / f'image-{index + 1}{Path(item["path"]).suffix.lower() or ".png"}'
+                shutil.copyfile(item['path'], image)
                 command.extend(['--image', str(image)])
             command.append('-')
             try:

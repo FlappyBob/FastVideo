@@ -10,7 +10,7 @@ import uuid
 from contextlib import contextmanager
 from collections.abc import Callable, Generator
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
@@ -39,6 +39,9 @@ class Recipe(StrictModel):
     text_encoder_cpu_offload: bool = True
     vae_cpu_offload: bool = True
     enable_torch_compile: bool = False
+    # Preview renders the same prompt/seed on a smaller canvas so composition,
+    # action and cuts can be judged quickly; final uses the full canvas.
+    tier: Literal['preview', 'final'] = 'final'
 
     @model_validator(mode='before')
     @classmethod
@@ -52,6 +55,58 @@ class Recipe(StrictModel):
                                      vsa_tile_size=64).items():
                 value.setdefault(key, default)
         return value
+
+
+PREVIEW_SCALE = 2 / 3
+CANVAS_MULTIPLE = 32
+
+
+def preview_canvas(width: int, height: int) -> tuple[int, int]:
+    """Smaller canvas with the same aspect, on the 32-pixel grid H3 requires."""
+
+    def shrink(value: int) -> int:
+        return max(CANVAS_MULTIPLE, round(value * PREVIEW_SCALE / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+
+    return shrink(width), shrink(height)
+
+
+def effective_recipe(recipe: Recipe) -> dict[str, Any]:
+    """Generation parameters actually submitted for this tier."""
+    values = recipe.model_dump(exclude={'tier'})
+    if recipe.tier == 'preview':
+        values['width'], values['height'] = preview_canvas(recipe.width, recipe.height)
+    return values
+
+
+class ShotEdit(StrictModel):
+    """Editorial decisions for one shot. They never change generation inputs."""
+    in_seconds: float = Field(default=0, ge=0, le=600)
+    out_seconds: float | None = Field(default=None, gt=0, le=600)
+    transition: Literal['cut', 'crossfade', 'fade_black'] = 'cut'
+    transition_seconds: float = Field(default=0.5, ge=0.1, le=3)
+    caption: str = Field(default='', max_length=200)
+    caption_start: float = Field(default=0, ge=0, le=600)
+    caption_end: float | None = Field(default=None, gt=0, le=600)
+
+    @model_validator(mode='after')
+    def ordered(self) -> ShotEdit:
+        if self.out_seconds is not None and self.out_seconds <= self.in_seconds:
+            raise ValueError('Shot out point must be after its in point')
+        if self.caption_end is not None and self.caption_end <= self.caption_start:
+            raise ValueError('Caption end must be after its start')
+        return self
+
+
+class Soundtrack(StrictModel):
+    asset_id: Key | None = None
+    gain_db: float = Field(default=-14, ge=-40, le=6)
+    duck: bool = True
+    fade_out_seconds: float = Field(default=2, ge=0, le=15)
+
+
+class CaptionStyle(StrictModel):
+    font_size: int = Field(default=44, ge=12, le=200)
+    position: Literal['bottom', 'top'] = 'bottom'
 
 
 class Character(StrictModel):
@@ -69,6 +124,7 @@ class Shot(StrictModel):
     asset_ids: list[Key] = Field(default_factory=list, max_length=9)
     previous_shot_id: Key | None = None
     seed: int = Field(default=1024, ge=0, le=2**63 - 1)
+    edit: ShotEdit = Field(default_factory=ShotEdit)
 
 
 class Blueprint(StrictModel):
@@ -78,6 +134,8 @@ class Blueprint(StrictModel):
     characters: list[Character] = Field(default_factory=list, max_length=30)
     shots: list[Shot] = Field(default_factory=list, max_length=32)
     recipe: Recipe = Field(default_factory=lambda: Recipe.model_validate({}))
+    soundtrack: Soundtrack = Field(default_factory=Soundtrack)
+    captions: CaptionStyle = Field(default_factory=CaptionStyle)
 
     @model_validator(mode='after')
     def relations(self) -> Blueprint:
@@ -105,19 +163,26 @@ def digest(value: Any) -> str:
                                      allow_nan=False).encode()).hexdigest()
 
 
-def shot_fingerprints(plan: Blueprint) -> dict[str, str]:
+def shot_fingerprints(plan: Blueprint, *, ignore_tier: bool = False) -> dict[str, str]:
+    """Generation-input identity per shot. Editorial fields never enter it.
+
+    With ``ignore_tier`` the key identifies the content regardless of
+    preview/final canvas, which is how a final take is matched to the preview
+    that was accepted for it.
+    """
     characters = {c.id: c.model_dump() for c in plan.characters}
     shots = {s.id: s for s in plan.shots}
     keys: dict[str, str] = {}
+    recipe = plan.recipe.model_dump(exclude={'tier'} if ignore_tier else None)
 
     def visit(key: str) -> str:
         if key not in keys:
             shot = shots[key]
             keys[key] = digest(
-                dict(shot=shot.model_dump(exclude={'title'}),
+                dict(shot=shot.model_dump(exclude={'title', 'edit'}),
                      style=plan.style,
                      characters=[characters[c] for c in shot.character_ids],
-                     recipe=plan.recipe.model_dump(),
+                     recipe=recipe,
                      previous=visit(shot.previous_shot_id) if shot.previous_shot_id else None))
         return keys[key]
 
@@ -126,15 +191,20 @@ def shot_fingerprints(plan: Blueprint) -> dict[str, str]:
     return keys
 
 
+def content_keys(plan: Blueprint) -> dict[str, str]:
+    return shot_fingerprints(plan, ignore_tier=True)
+
+
 def compile_jobs(plan: Blueprint, assets: dict, job_ids: dict[str, str]) -> dict[str, dict]:
     """Pure admission: validate the whole project before creating any GPU job."""
     characters = {c.id: c for c in plan.characters}
+    recipe = effective_recipe(plan.recipe)
     output = {}
     for shot in plan.shots:
         character_assets = [asset for key in shot.character_ids for asset in characters[key].asset_ids]
         asset_ids = list(dict.fromkeys(character_assets + shot.asset_ids))
-        if any(key not in assets for key in asset_ids):
-            raise ValueError(f'Shot {shot.id} references an unknown asset')
+        if any(key not in assets or assets[key].get('kind', 'image') != 'image' for key in asset_ids):
+            raise ValueError(f'Shot {shot.id} references an unknown or non-image asset')
         refs = [dict(source=assets[key]['path'], media_type='image', sha256=assets[key]['sha256']) for key in asset_ids]
         if shot.previous_shot_id:
             refs.append(dict(source=f'job-last-frame:{job_ids[shot.previous_shot_id]}', media_type='image'))
@@ -150,7 +220,7 @@ def compile_jobs(plan: Blueprint, assets: dict, job_ids: dict[str, str]) -> dict
             prompt += f'\nReference image {index}: {", ".join(owners) or "scene/style reference"}. Preserve its appearance.'
         if shot.previous_shot_id:
             prompt += f'\nReference image {len(refs)} shows the preceding shot ending; maintain subject, setting and motion continuity.'
-        output[shot.id] = dict(**plan.recipe.model_dump(),
+        output[shot.id] = dict(**recipe,
                                name=f'{plan.title} / {shot.title}'.strip(),
                                prompt=prompt.strip(),
                                seed=shot.seed,
@@ -211,7 +281,19 @@ class AgentProjectStore:
         row = conn.execute('SELECT data FROM agent_projects WHERE id=?', (project_id, )).fetchone()
         if not row:
             raise KeyError('Project not found')
-        return json.loads(row[0])
+        project = json.loads(row[0])
+        # Projects written before editorial/timing fields existed stay readable.
+        plan = Blueprint.model_validate(project['blueprint'])
+        project['blueprint'] = plan.model_dump()
+        project.setdefault('content_keys', content_keys(plan))
+        project.setdefault('timings', [])
+        project.setdefault('renders', [])
+        for takes in project['takes'].values():
+            for take in takes:
+                take.setdefault('tier', 'final')
+                take.setdefault('content_key', None)
+                take.setdefault('observation', None)
+        return project
 
     @staticmethod
     def _save(conn: sqlite3.Connection, project: dict[str, Any]) -> None:
@@ -225,12 +307,15 @@ class AgentProjectStore:
                        approved_revision=None,
                        blueprint=plan.model_dump(),
                        fingerprints=shot_fingerprints(plan),
+                       content_keys=content_keys(plan),
                        takes={},
                        selected={},
                        stale_shots=[],
                        operations={},
                        created_at=time.time(),
-                       messages=[])
+                       messages=[],
+                       timings=[],
+                       renders=[])
         with self.connection() as conn:
             self._save(conn, project)
             conn.execute('INSERT INTO agent_versions VALUES (?,?,?)',
@@ -260,10 +345,16 @@ class AgentProjectStore:
             if project['revision'] != expected_revision:
                 raise ValueError('Project revision changed; reload before saving')
             changed = [key for key, value in fingerprints.items() if project['fingerprints'].get(key) != value]
+            # Approval binds generation inputs. A purely editorial revision
+            # (trims, captions, soundtrack) keeps it; any input change drops it.
+            inputs_unchanged = fingerprints == project['fingerprints']
+            carried = expected_revision + 1 if inputs_unchanged and project['approved_revision'] == expected_revision \
+                else None
             project.update(revision=expected_revision + 1,
                            blueprint=plan.model_dump(),
-                           approved_revision=None,
+                           approved_revision=carried,
                            fingerprints=fingerprints,
+                           content_keys=content_keys(plan),
                            stale_shots=changed)
             project['selected'] = {
                 key: value
@@ -292,9 +383,25 @@ class AgentProjectStore:
                 raise ValueError('Unknown shot')
             records = project['takes'].setdefault(shot_id, [])
             if not any(take['job_id'] == job_id for take in records):
-                records.append(dict(job_id=job_id, fingerprint=fingerprint, review='pending', note=''))
+                records.append(
+                    dict(job_id=job_id,
+                         fingerprint=fingerprint,
+                         review='pending',
+                         note='',
+                         tier=project['blueprint']['recipe']['tier'],
+                         content_key=project['content_keys'].get(shot_id),
+                         observation=None))
             if project['fingerprints'][shot_id] == fingerprint:
                 project['selected'][shot_id] = job_id
+
+        return self.mutate(project_id, change)
+
+    def record_timing(self, project_id: str, kind: str, seconds: float, **fields: Any) -> dict[str, Any]:
+        """Append one wall-clock measurement (planning, rendering, waiting)."""
+
+        def change(project: dict[str, Any]) -> None:
+            project['timings'].append(dict(kind=kind, seconds=round(float(seconds), 3), at=time.time(), **fields))
+            del project['timings'][:-500]
 
         return self.mutate(project_id, change)
 

@@ -124,6 +124,42 @@ test('story references, approval, review, export and dependent revision survive 
 		'../../outputs/studio_video_agent/synthetic-browser-export.mp4',
 		await film.body(),
 	);
+	// Observation: every completed take shows a timestamped key-frame sheet
+	// derived from its actual media, and the editorial cut renders from the
+	// accepted takes with a crossfade and a burned-in caption.
+	const sheets = page.getByRole('img', { name: /Key frames of/ });
+	await expect(sheets).toHaveCount(3);
+	for (const sheet of await sheets.all()) {
+		await expect
+			.poll(() => sheet.evaluate((element: HTMLImageElement) => element.naturalWidth))
+			.toBeGreaterThan(0);
+	}
+	await expect(page.getByText('Mostly static').first()).toBeVisible();
+	await page.getByText('Edit decisions').nth(1).click();
+	await page.getByLabel('Transition from previous shot').nth(1).selectOption('crossfade');
+	await page.getByLabel('Caption (burned in)').nth(1).fill('第二镜 · station');
+	await page.getByRole('button', { name: 'Save storyboard' }).click();
+	await expect(page.getByRole('button', { name: 'Render cut' })).toBeEnabled();
+	await page.getByRole('button', { name: 'Render cut' }).click();
+	await expect(page.getByRole('link', { name: 'Download cut' })).toBeVisible({
+		timeout: 120_000,
+	});
+	const cutUrl = await page
+		.getByRole('link', { name: 'Download cut' })
+		.getAttribute('href');
+	const cut = await request.get(new URL(cutUrl!, page.url()).href);
+	expect(cut.ok()).toBeTruthy();
+	await writeFile(
+		'../../outputs/studio_video_agent/synthetic-browser-cut.mp4',
+		await cut.body(),
+	);
+	await expect(page.getByText(/crossfade/).first()).toBeVisible();
+	const project = await (
+		await request.get(`${API_BASE}/agent/projects/${id}`)
+	).json();
+	expect(project.approved_revision).toBe(project.revision);
+	expect(project.renders).toHaveLength(1);
+	expect(project.blueprint.shots[1].edit.transition).toBe('crossfade');
 	await page.reload();
 	await expect(page.getByLabel('Story title')).toHaveValue(blueprint.title);
 	await page

@@ -69,7 +69,7 @@ export function CharacterLibrary({
 				</div>
 			</div>
 			<div className="mt-4 flex flex-wrap gap-3">
-				{project.assets?.map((asset) => (
+				{project.assets?.filter((a) => (a.kind ?? 'image') === 'image').map((asset) => (
 					<figure key={asset.id} className="w-24">
 						<img
 							src={assetUrl(project.id, asset.id)}
@@ -124,7 +124,7 @@ export function CharacterLibrary({
 							/>
 						</label>
 						<div className="flex flex-wrap gap-2">
-							{project.assets?.map((asset) => (
+							{project.assets?.filter((a) => (a.kind ?? 'image') === 'image').map((asset) => (
 								<label key={asset.id} className="text-xs">
 									<input
 										type="checkbox"

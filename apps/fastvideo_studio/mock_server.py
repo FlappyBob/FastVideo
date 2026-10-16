@@ -1264,9 +1264,23 @@ def _queue_agent_mock_jobs(ids, *, expected_jobs=None):
         return _enqueue(ids)
 
 
+def _agent_mock_video_path(job):
+    """Mock takes share one synthetic clip unless the job points at a real file."""
+    output_path = job.get("output_path") or ""
+    if output_path and os.path.isfile(output_path):
+        return output_path
+    return _build_mock_media("mp4") if output_path else None
+
+
 _agent_mock_service = AgentService(
-    AgentProjectStore(_scene_db._path), _create_agent_mock_job, _get_agent_mock_job, _queue_agent_mock_jobs,
-    lambda: list(dict.fromkeys([_AGENT_V2] + [m for values in _MODELS_BY_WORKLOAD.values() for m in values])))
+    AgentProjectStore(_scene_db._path),
+    _create_agent_mock_job,
+    _get_agent_mock_job,
+    _queue_agent_mock_jobs,
+    lambda: list(dict.fromkeys([_AGENT_V2] + [m for values in _MODELS_BY_WORKLOAD.values() for m in values])),
+    video_path=_agent_mock_video_path,
+    cache_dir=os.path.join(_MERGED_DIR, "agent-observations"),
+    output_dir=_MERGED_DIR)
 app.include_router(build_agent_router(lambda: _agent_mock_service, Path(_scene_db._path).parent / "assets", mock=True))
 
 if __name__ == "__main__":
